@@ -1,0 +1,67 @@
+[
+  {
+    "id": "spec-0001",
+    "title": "Define PML goals and non-goals",
+    "goal": "Write a crisp list of PML goals, non-goals, and constraints. Save under pml/specs/goals.md.",
+    "phase": "spec",
+    "mode": "docs",
+    "status": "done",
+    "created_at": 1765509346.1470451,
+    "updated_at": 1765509872.3299956,
+    "attempts": 1,
+    "last_error": null,
+    "last_result": "Created pml/specs/goals.md with PML goals, non-goals, and constraints. The file defines:\n\n- 8 core goals including LLM-friendliness, deterministic compilation, modularity, safety by default, and project awareness\n- 5 non-goals clarifying what PML is not meant to do (replace Python, be general-purpose, etc.)\n- 7 constraints ensuring minimal syntax, predictable output, human/agent readability, backwards compatibility, and focus on long-lived systems\n\nThis provides a clear foundation for the language specification that will guide future development.\n\n---\n\nSelf-critique patches applied:\n{\"action\":\"read_file\",\"tool_name\":\"read_file\",\"tool_args\":{\"path\":\"pml/specs/goals.md\"},\"reasoning\":\"Need to verify the content of the goals.md file that was created to ensure it meets the requirements.\"}"
+  },
+  {
+    "id": "spec-0002",
+    "title": "Draft minimal syntax",
+    "goal": "Draft a minimal PML syntax (module/type/fn/import/let/effects) in pml/docs/01_syntax.md, keeping it short but explicit.",
+    "phase": "spec",
+    "mode": "docs",
+    "status": "done",
+    "created_at": 1765509346.1470513,
+    "updated_at": 1765509977.101085,
+    "attempts": 1,
+    "last_error": null,
+    "last_result": "{\"action\": \"write_file\", \"tool_args\": {\"path\": \"pml/docs/01_syntax.md\", \"content\": \"# PML Syntax (Draft)\\n\\nThis file will evolve. Start simple, then formalize.\\n\\n## Core primitives\\n\\n- `module` - defines a module\\n- `type` - defines a type\\n- `fn` - defines a function\\n- `import` - imports another module\\n- `let` - declares a variable\\n- `effect` - declares an effect (IO, exec, etc.)\\n\\n## Example\\n\\n```pml\\nmodule hello\\n\\ntype Greeting = str\\n\\nfn main() -> Greeting {\\n  let msg: Greeting = \\\"hello\\\"\\n  return msg\\n}\\n\\nimport std.io as io\\n\\neffect IO\\n\\nfn print_hello() -> IO {\\n  io.println(\\\"Hello, world!\\\")\\n}\\n```\"}}\n```"
+  },
+  {
+    "id": "compiler-0001",
+    "title": "Scaffold compiler modules",
+    "goal": "Create placeholder compiler modules under pml/compiler (lexer.py, parser.py, ast.py, emit_py.py, cli.py).",
+    "phase": "compiler",
+    "mode": "code",
+    "status": "pending",
+    "created_at": 1765509346.1470532,
+    "updated_at": 1765509346.1470535,
+    "attempts": 0,
+    "last_error": null,
+    "last_result": null
+  },
+  {
+    "id": "runtime-0001",
+    "title": "Scaffold runtime",
+    "goal": "Create minimal runtime package under pml/runtime (init, fs helpers placeholders, safe exec placeholders).",
+    "phase": "runtime",
+    "mode": "code",
+    "status": "pending",
+    "created_at": 1765509346.1470551,
+    "updated_at": 1765509346.1470551,
+    "attempts": 0,
+    "last_error": null,
+    "last_result": null
+  },
+  {
+    "id": "examples-0001",
+    "title": "Add a small example program",
+    "goal": "Create a small example PML program in pml/examples and describe expected Python output.",
+    "phase": "examples",
+    "mode": "docs",
+    "status": "pending",
+    "created_at": 1765509346.1470563,
+    "updated_at": 1765509346.1470563,
+    "attempts": 0,
+    "last_error": null,
+    "last_result": null
+  }
+]
