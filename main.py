@@ -1,869 +1,253 @@
 #!/usr/bin/env python3
-"""Project Me — PML-only autonomous agent.
-
-This script is intentionally a single file, but internally modular.
-It maintains a PML workspace under ./pml/ and can run for days:
-- Steps queue from pml/steps.json
-- Memory log in pml/memory.jsonl
-- Lightweight RAG over memory + workspace index
-- LM Studio chat/completions client (persistent session, optional streaming)
-- Tool layer for safe file ops + safe shell
-- Multi-step agent loop with self-critique + repair
-- Autosave snapshots + Git commit/push checkpoints
-- Thermal-only cooldown monitor (no “high RAM usage” sleeps)
-
-Usage:
-  python main.py warmup
-  python main.py pml-init
-  python main.py pml-step
-  python main.py pml-loop --loop-till-stopped
-
-Compat flags:
-  python main.py --pml-create --loop-till-stopped
-"""
-
 from __future__ import annotations
 
 import argparse
-import contextlib
 import dataclasses
-import datetime as _dt
-import hashlib
 import json
 import os
-import queue
 import re
 import shutil
+import signal
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
-import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
 import requests
 
-# --------------------------------------------------------------------------------------
-# Paths / core config
-# --------------------------------------------------------------------------------------
-
-BASE_DIR = Path(__file__).resolve().parent
-PML_DIR = BASE_DIR / "pml"
-PML_DOCS_DIR = PML_DIR / "docs"
-PML_SPEC_DIR = PML_DIR / "specs"
-PML_COMPILER_DIR = PML_DIR / "compiler"
-PML_RUNTIME_DIR = PML_DIR / "runtime"
-PML_EXAMPLES_DIR = PML_DIR / "examples"
-PML_TMP_DIR = PML_DIR / "tmp"
-
-PML_STEPS_PATH = PML_DIR / "steps.json"
-PML_MEMORY_PATH = PML_DIR / "memory.jsonl"
-PML_INDEX_PATH = PML_DIR / "index.json"
-PML_RUN_LOG = PML_DIR / "run.log"
-PML_CRASH_LOG = PML_DIR / "crash.log"
-PML_CHECKPOINT_DIR = PML_DIR / "checkpoints"
-PML_CONFIG_PATH = PML_DIR / "config.json"
-
-DEFAULT_LM_URL = os.environ.get("LMSTUDIO_URL", "http://127.0.0.1:1234/v1/chat/completions")
-DEFAULT_LM_MODEL = os.environ.get("LMSTUDIO_MODEL", "qwen/qwen3-coder-30b")
-DEFAULT_MAX_TOKENS = int(os.environ.get("PML_MAX_TOKENS", "2048"))
-DEFAULT_TEMPERATURE = float(os.environ.get("PML_TEMPERATURE", "0.2"))
-DEFAULT_TOP_P = float(os.environ.get("PML_TOP_P", "0.9"))
-
-DEFAULT_AGENT_CALLS_PER_STEP = int(os.environ.get("PML_AGENT_CALLS", "4"))
-DEFAULT_SLEEP_BETWEEN_STEPS = int(os.environ.get("PML_SLEEP_BETWEEN", "3"))
-
-# Thermal-only safety. No “RAM high => sleep” behavior.
-DEFAULT_MAX_GPU_TEMP_C = int(os.environ.get("PML_MAX_GPU_TEMP_C", "87"))
-DEFAULT_MAX_CPU_TEMP_C = int(os.environ.get("PML_MAX_CPU_TEMP_C", "95"))
-DEFAULT_OVERHEAT_COOLDOWN_SEC = int(os.environ.get("PML_OVERHEAT_COOLDOWN_SEC", str(10 * 60)))
-
-# HTTPS support:
-# - If your LM Studio is behind a reverse proxy with HTTPS, set LMSTUDIO_URL=https://...
-# - Set LMSTUDIO_SSL_VERIFY=0 to disable cert validation if you're using self-signed certs.
-DEFAULT_SSL_VERIFY = os.environ.get("LMSTUDIO_SSL_VERIFY", "1") not in ("0", "false", "False")
-
-# Shell safety list (tight by default). Add via env PML_SHELL_ALLOW="git,python,pytest" etc.
-_BASE_ALLOWED_SHELL = {
-    "python",
-    "py",
-    "pytest",
-    "pip",
-    "uv",
-    "dir",
-    "ls",
-    "type",
-    "cat",
-    "echo",
-    "git",
-}
-_env_allow = os.environ.get("PML_SHELL_ALLOW", "").strip()
-if _env_allow:
-    for part in _env_allow.split(","):
-        p = part.strip().lower()
-        if p:
-            _BASE_ALLOWED_SHELL.add(p)
-ALLOWED_SHELL_PREFIXES = tuple(sorted(_BASE_ALLOWED_SHELL))
-
-# Workspace policy
-# Keep all language work under ./pml. Tools are restricted to BASE_DIR by safe_path().
-# The agent prompt itself instructs “ONLY edit ./pml”.
+ActionType = Literal["tool", "final"]
 
 
-# --------------------------------------------------------------------------------------
-# Logging
-# --------------------------------------------------------------------------------------
-
-class Logger:
-    def __init__(self, log_path: Path, also_stdout: bool = True) -> None:
-        self.log_path = log_path
-        self.also_stdout = also_stdout
-        self._lock = threading.Lock()
-
-    def _write(self, line: str) -> None:
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.log_path.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
-
-    def log(self, msg: str) -> None:
-        ts = time.strftime("%H:%M:%S")
-        tid = threading.get_ident()
-        line = f"[{ts}][T{tid}] {msg}"
-        with self._lock:
-            if self.also_stdout:
-                print(line, flush=True)
-            try:
-                self._write(line)
-            except Exception:
-                pass
-
-    def exception(self, msg: str) -> None:
-        self.log("[EXC] " + msg)
-        tb = traceback.format_exc()
-        for ln in tb.splitlines():
-            self.log("[EXC] " + ln)
+def _ts() -> str:
+    return time.strftime("%H:%M:%S")
 
 
-LOG = Logger(PML_RUN_LOG)
+def log(msg: str) -> None:
+    tid = threading.get_ident()
+    print(f"[{_ts()}][T{tid}] {msg}", flush=True)
 
 
-def crashlog(msg: str) -> None:
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+def jdump(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2)
+
+
+def clamp_int(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
+
+
+def now() -> float:
+    return time.time()
+
+
+def try_import_psutil():
     try:
-        PML_CRASH_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with PML_CRASH_LOG.open("a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {msg}\n")
+        import psutil  # type: ignore
+
+        return psutil
     except Exception:
-        pass
-
-
-# --------------------------------------------------------------------------------------
-# Atomic write helpers / durability
-# --------------------------------------------------------------------------------------
-
-
-def atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
-
-
-def atomic_write_json(path: Path, obj: Any, *, indent: int = 2) -> None:
-    atomic_write_text(path, json.dumps(obj, ensure_ascii=False, indent=indent))
-
-
-# --------------------------------------------------------------------------------------
-# Safe path + tool layer
-# --------------------------------------------------------------------------------------
-
-
-def safe_path(rel: str) -> Path:
-    p = (BASE_DIR / rel).resolve()
-    if not str(p).startswith(str(BASE_DIR)):
-        raise ValueError(f"Path escapes project root: {p}")
-    return p
-
-
-def ensure_pml_layout() -> None:
-    for d in [
-        PML_DIR,
-        PML_DOCS_DIR,
-        PML_SPEC_DIR,
-        PML_COMPILER_DIR,
-        PML_RUNTIME_DIR,
-        PML_EXAMPLES_DIR,
-        PML_TMP_DIR,
-        PML_CHECKPOINT_DIR,
-    ]:
-        d.mkdir(parents=True, exist_ok=True)
-
-
-def tool_list_dir(path: str = ".") -> Dict[str, Any]:
-    p = safe_path(path)
-    items = []
-    for child in sorted(p.iterdir(), key=lambda x: x.name.lower()):
-        try:
-            size = child.stat().st_size if child.is_file() else 0
-        except Exception:
-            size = 0
-        items.append({"name": child.name, "is_dir": child.is_dir(), "size": size})
-    return {"cwd": str(p), "items": items}
-
-
-def tool_tree(path: str = "pml", max_nodes: int = 600) -> Dict[str, Any]:
-    root = safe_path(path)
-    nodes = 0
-    lines: List[str] = []
-
-    def walk(p: Path, prefix: str = "") -> None:
-        nonlocal nodes
-        if nodes >= max_nodes:
-            return
-        try:
-            children = sorted(p.iterdir(), key=lambda x: x.name.lower())
-        except Exception:
-            return
-        for i, child in enumerate(children):
-            if nodes >= max_nodes:
-                return
-            connector = "└── " if i == len(children) - 1 else "├── "
-            lines.append(f"{prefix}{connector}{child.name}")
-            nodes += 1
-            if child.is_dir():
-                walk(child, prefix + ("    " if i == len(children) - 1 else "│   "))
-
-    lines.append(root.name + "/")
-    walk(root)
-    return {"path": str(root), "tree": "\n".join(lines), "nodes": nodes, "max_nodes": max_nodes}
-
-
-def tool_read_file(path: str, max_chars: int = 12000) -> Dict[str, Any]:
-    p = safe_path(path)
-    if not p.exists() or not p.is_file():
-        raise FileNotFoundError(str(p))
-    data = p.read_text(encoding="utf-8", errors="ignore")
-    truncated = len(data) > max_chars
-    return {
-        "path": str(p),
-        "content": data[:max_chars],
-        "truncated": truncated,
-        "size": p.stat().st_size,
-    }
-
-
-def tool_write_file(path: str, content: str, append: bool = False) -> Dict[str, Any]:
-    p = safe_path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    if append and p.exists():
-        with p.open("a", encoding="utf-8") as f:
-            f.write(content)
-        return {"path": str(p), "append": True, "bytes": len(content)}
-    atomic_write_text(p, content)
-    return {"path": str(p), "append": False, "bytes": len(content)}
-
-
-def tool_mkdir(path: str, exist_ok: bool = True) -> Dict[str, Any]:
-    p = safe_path(path)
-    p.mkdir(parents=True, exist_ok=exist_ok)
-    return {"path": str(p), "exists": True}
-
-
-def tool_move_path(src: str, dst: str) -> Dict[str, Any]:
-    s = safe_path(src)
-    d = safe_path(dst)
-    d.parent.mkdir(parents=True, exist_ok=True)
-    s.replace(d)
-    return {"src": str(s), "dst": str(d)}
-
-
-def tool_delete_path(path: str, recursive: bool = False) -> Dict[str, Any]:
-    p = safe_path(path)
-    if p == BASE_DIR:
-        raise ValueError("Refusing to delete project root")
-    if p.is_dir():
-        if not recursive:
-            p.rmdir()
-        else:
-            shutil.rmtree(p)
-    elif p.exists():
-        p.unlink()
-    return {"path": str(p), "deleted": True}
-
-
-def tool_grep(path: str, pattern: str, max_hits: int = 50) -> Dict[str, Any]:
-    root = safe_path(path)
-    rx = re.compile(pattern)
-    hits: List[Dict[str, Any]] = []
-    for f in root.rglob("*"):
-        if f.is_dir():
-            continue
-        if f.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".bin", ".exe"}:
-            continue
-        try:
-            text = f.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            continue
-        for m in rx.finditer(text):
-            if len(hits) >= max_hits:
-                return {"path": str(root), "pattern": pattern, "hits": hits, "truncated": True}
-            line_no = text[: m.start()].count("\n") + 1
-            start = max(0, m.start() - 80)
-            end = min(len(text), m.end() + 80)
-            snippet = text[start:end].replace("\n", " ")
-            hits.append({"file": str(f.relative_to(BASE_DIR)), "line": line_no, "snippet": snippet})
-    return {"path": str(root), "pattern": pattern, "hits": hits, "truncated": False}
-
-
-def tool_hash_file(path: str) -> Dict[str, Any]:
-    p = safe_path(path)
-    if not p.exists() or not p.is_file():
-        raise FileNotFoundError(str(p))
-    h = hashlib.sha256()
-    with p.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return {"path": str(p), "sha256": h.hexdigest(), "size": p.stat().st_size}
-
-
-def tool_run_shell(cmd: str) -> Dict[str, Any]:
-    cmd_strip = cmd.strip()
-    if not cmd_strip:
-        raise ValueError("Empty cmd")
-    first = cmd_strip.split()[0].lower()
-    if not any(first.startswith(pfx) for pfx in ALLOWED_SHELL_PREFIXES):
-        raise ValueError(f"Command not allowed by safety list: {first}")
-    proc = subprocess.run(
-        cmd_strip,
-        shell=True,
-        cwd=str(BASE_DIR),
-        capture_output=True,
-        text=True,
-        timeout=None,
-    )
-    return {
-        "cmd": cmd_strip,
-        "returncode": proc.returncode,
-        "stdout": (proc.stdout or "")[-12000:],
-        "stderr": (proc.stderr or "")[-12000:],
-    }
-
-
-TOOLS: Dict[str, Callable[..., Dict[str, Any]]] = {
-    "list_dir": tool_list_dir,
-    "tree": tool_tree,
-    "read_file": tool_read_file,
-    "write_file": tool_write_file,
-    "mkdir": tool_mkdir,
-    "move_path": tool_move_path,
-    "delete_path": tool_delete_path,
-    "grep": tool_grep,
-    "hash_file": tool_hash_file,
-    "run_shell": tool_run_shell,
-}
-
-
-# --------------------------------------------------------------------------------------
-# Git checkpointing
-# --------------------------------------------------------------------------------------
-
-
-def _run_git(args: List[str]) -> Tuple[int, str, str]:
-    proc = subprocess.run(
-        ["git", *args],
-        cwd=str(BASE_DIR),
-        capture_output=True,
-        text=True,
-        timeout=None,
-    )
-    return proc.returncode, proc.stdout or "", proc.stderr or ""
-
-
-def git_has_changes() -> bool:
-    try:
-        rc, out, _ = _run_git(["status", "--porcelain"])
-        return rc == 0 and bool(out.strip())
-    except Exception:
-        return False
-
-
-def git_autosave(message: str) -> Dict[str, Any]:
-    if not (BASE_DIR / ".git").exists():
-        return {"ok": False, "reason": "no .git repo"}
-    if not git_has_changes():
-        return {"ok": False, "reason": "no changes"}
-
-    rc1, out1, err1 = _run_git(["add", "-A"])
-    rc2, out2, err2 = _run_git(["commit", "-m", message])
-    rc3, out3, err3 = _run_git(["push"])
-
-    ok = (rc1 == 0) and (rc2 == 0 or "nothing to commit" in (out2 + err2).lower()) and (rc3 == 0)
-    return {
-        "ok": ok,
-        "add": {"rc": rc1, "out": out1[-2000:], "err": err1[-2000:]},
-        "commit": {"rc": rc2, "out": out2[-2000:], "err": err2[-2000:]},
-        "push": {"rc": rc3, "out": out3[-2000:], "err": err3[-2000:]},
-    }
-
-
-# --------------------------------------------------------------------------------------
-# Health monitor (thermal-only)
-# --------------------------------------------------------------------------------------
-
-
-class HealthMonitor:
-    def __init__(
-        self,
-        *,
-        max_gpu_temp_c: int = DEFAULT_MAX_GPU_TEMP_C,
-        max_cpu_temp_c: int = DEFAULT_MAX_CPU_TEMP_C,
-        cooldown_seconds: int = DEFAULT_OVERHEAT_COOLDOWN_SEC,
-    ) -> None:
-        self.max_gpu_temp_c = max_gpu_temp_c
-        self.max_cpu_temp_c = max_cpu_temp_c
-        self.cooldown_seconds = cooldown_seconds
-
-    def _read_gpu_temp_nvidia_smi(self) -> Optional[int]:
-        try:
-            proc = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=temperature.gpu",
-                    "--format=csv,noheader,nounits",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=None,
-            )
-            if proc.returncode != 0:
-                return None
-            txt = (proc.stdout or "").strip().splitlines()
-            if not txt:
-                return None
-            return int(txt[0].strip())
-        except Exception:
-            return None
-
-    def _read_cpu_temp_best_effort(self) -> Optional[int]:
-        # Cross-platform CPU temp is messy in Python without extra deps.
-        # We keep this best-effort. If unknown, we just skip CPU temp gating.
-        # On Linux, psutil.sensors_temperatures might work. On Windows, usually not.
-        try:
-            import psutil  # type: ignore
-
-            temps = getattr(psutil, "sensors_temperatures", None)
-            if not temps:
-                return None
-            d = temps(fahrenheit=False)
-            if not d:
-                return None
-            best: Optional[float] = None
-            for _, entries in d.items():
-                for e in entries:
-                    if e.current is None:
-                        continue
-                    if best is None or e.current > best:
-                        best = float(e.current)
-            if best is None:
-                return None
-            return int(round(best))
-        except Exception:
-            return None
-
-    def check_and_cool_if_overheated(self) -> None:
-        gpu_t = self._read_gpu_temp_nvidia_smi()
-        cpu_t = self._read_cpu_temp_best_effort()
-
-        over = False
-        reasons: List[str] = []
-        if gpu_t is not None and gpu_t >= self.max_gpu_temp_c:
-            over = True
-            reasons.append(f"gpu_temp={gpu_t}C >= {self.max_gpu_temp_c}C")
-        if cpu_t is not None and cpu_t >= self.max_cpu_temp_c:
-            over = True
-            reasons.append(f"cpu_temp={cpu_t}C >= {self.max_cpu_temp_c}C")
-
-        if over:
-            LOG.log(f"[HEALTH] Overheat detected ({', '.join(reasons)}). Cooling for {self.cooldown_seconds}s")
-            time.sleep(self.cooldown_seconds)
-        else:
-            # Optional trace once in a while handled by caller.
-            pass
-
-
-# --------------------------------------------------------------------------------------
-# PML docs + workspace index
-# --------------------------------------------------------------------------------------
-
-
-class PMLDocs:
-    def __init__(self) -> None:
-        ensure_pml_layout()
-
-    def ensure_skeleton(self) -> None:
-        ensure_pml_layout()
-
-        def w(rel: str, content: str) -> None:
-            p = safe_path(rel)
-            if not p.exists():
-                atomic_write_text(p, content)
-
-        w(
-            "pml/docs/00_pml_overview.md",
-            """# PML — Project Me Language (Programmable Meta Language)\n\n"
-            "PML is a domain-specific language that compiles to Python.\n\n"
-            "**Design goals**\n"
-            "- LLM-friendly: easy to generate, refactor, and validate\n"
-            "- Deterministic compilation: PML -> Python with predictable output\n"
-            "- Modular for big systems: packages, modules, interfaces\n"
-            "- Safe by default: explicit permissions for IO / exec\n\n"
-            "**Project folders**\n"
-            "- `pml/specs/` language specs\n"
-            "- `pml/compiler/` parser / AST / emitter\n"
-            "- `pml/runtime/` runtime helpers used by emitted Python\n"
-            "- `pml/examples/` sample PML programs\n""",
-        )
-
-        w(
-            "pml/docs/01_syntax.md",
-            """# PML Syntax (Draft)\n\n"
-            "This file will evolve. Start simple, then formalize.\n\n"
-            "## Core primitives\n"
-            "- `module`\n"
-            "- `type`\n"
-            "- `fn`\n"
-            "- `import`\n"
-            "- `let`\n\n"
-            "## Example (placeholder)\n"
-            "```pml\n"
-            "module hello\n"
-            "fn main() -> str {\n"
-            "  return \"hello\"\n"
-            "}\n"
-            "```\n""",
-        )
-
-        w(
-            "pml/docs/02_compiler_arch.md",
-            """# Compiler Architecture\n\n"
-            "PML compiler pipeline (target: Python):\n\n"
-            "1) Lexer\n"
-            "2) Parser -> AST\n"
-            "3) Semantic checks (types, imports, permissions)\n"
-            "4) Lowering / normalization\n"
-            "5) Python emitter\n\n"
-            "We keep output stable: same PML => same Python.\n""",
-        )
-
-        w(
-            "pml/docs/03_runtime.md",
-            """# Runtime\n\n"
-            "The runtime is a small Python library used by emitted code.\n"
-            "Keep it minimal and well-tested.\n""",
-        )
-
-        w(
-            "pml/specs/core.md",
-            """# PML Core Spec (Draft)\n\n"
-            "## Version\n"
-            "- Spec version: 0.0.1\n\n"
-            "## Modules\n"
-            "A PML module is the compilation unit.\n\n"
-            "## Types\n"
-            "Start with: int, float, bool, str, list[T], dict[K,V]\n\n"
-            "## Functions\n"
-            "Pure-by-default unless explicitly marked with effects.\n\n"
-            "## Effects / Permissions\n"
-            "- fs.read\n"
-            "- fs.write\n"
-            "- net.http\n"
-            "- proc.exec\n""",
-        )
-
-        w(
-            "pml/compiler/README.md",
-            """# pml/compiler\n\n"
-            "This folder will contain the PML compiler.\n"
-            "Target modules:\n"
-            "- lexer.py\n"
-            "- parser.py\n"
-            "- ast.py\n"
-            "- sema.py\n"
-            "- emit_py.py\n"
-            "- cli.py\n""",
-        )
-
-        w(
-            "pml/runtime/README.md",
-            """# pml/runtime\n\n"
-            "Runtime helpers used by emitted Python.\n""",
-        )
-
-        w(
-            "pml/examples/hello.pml",
-            """module hello\n\nfn main() -> str {\n  return \"hello\"\n}\n""",
-        )
-
-    def update_workspace_index(self, *, max_files: int = 500) -> Dict[str, Any]:
-        ensure_pml_layout()
-
-        def is_text_file(p: Path) -> bool:
-            if p.is_dir():
-                return False
-            if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".bin", ".exe", ".dll"}:
-                return False
-            return True
-
-        items: List[Dict[str, Any]] = []
-        count = 0
-        for f in sorted(PML_DIR.rglob("*"), key=lambda x: str(x).lower()):
-            if count >= max_files:
-                break
-            if not is_text_file(f):
-                continue
-            rel = str(f.relative_to(BASE_DIR))
-            try:
-                text = f.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                continue
-            sha = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
-            summary = text[:1200]
-            items.append(
-                {
-                    "path": rel,
-                    "sha256": sha,
-                    "size": len(text),
-                    "head": summary,
-                }
-            )
-            count += 1
-
-        obj = {
-            "ts": time.time(),
-            "files": items,
-            "truncated": count >= max_files,
-            "max_files": max_files,
-        }
-        atomic_write_json(PML_INDEX_PATH, obj)
-        return {"ok": True, "files": len(items), "truncated": obj["truncated"]}
-
-
-# --------------------------------------------------------------------------------------
-# Steps
-# --------------------------------------------------------------------------------------
+        return None
 
 
 @dataclass
-class PMLStep:
-    id: str
-    title: str
-    goal: str
-    phase: str
-    mode: str
-    status: str = "pending"  # pending|doing|done|failed
-    created_at: float = field(default_factory=lambda: time.time())
-    updated_at: float = field(default_factory=lambda: time.time())
-    attempts: int = 0
-    last_error: Optional[str] = None
-    last_result: Optional[str] = None
+class AppConfig:
+    lm_url: str = "http://127.0.0.1:1234/v1/chat/completions"
+    lm_model: str = "qwen/qwen3-coder-30b"
+    stream: bool = False
+    ssl_verify: bool = True
+
+    timeout_s: Optional[float] = None
+
+    ctx_len: int = 4096
+    max_tokens: int = 2048
+    temperature: float = 0.2
+    top_p: float = 0.9
+
+    agent_calls: int = 6
+    sleep_between: int = 0
+    loop_till_stopped: bool = False
+
+    monitor: bool = True
+    monitor_interval_s: int = 10
+    max_gpu_temp_c: int = 86
+    max_cpu_temp_c: int = 95
+    cooldown_s: int = 600
+
+    auto_approve: bool = True
+    safe_mode: bool = True
+
+    git_auto: bool = True
+    git_push: bool = True
+    git_interval_s: int = 300
+
+    rag_k: int = 3
+    max_rag_chars: int = 2500
+    max_workspace_chars: int = 2500
 
 
-class StepStore:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        ensure_pml_layout()
+class ProjectPaths:
+    def __init__(self, base_dir: Path):
+        self.base_dir = base_dir
+        self.pml_dir = base_dir / "pml"
+        self.db_path = self.pml_dir / "pml.db"
+        self.docs_path = self.pml_dir / "PML.md"
+        self.steps_json_path = self.pml_dir / "steps.json"
+        self.heartbeat_path = self.pml_dir / "heartbeat.json"
+        self.runlog_path = self.pml_dir / "runlog.jsonl"
+        self.lock_path = self.pml_dir / "run.lock"
 
-    def load(self) -> List[PMLStep]:
-        if not self.path.exists():
-            return []
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-        steps: List[PMLStep] = []
-        for obj in raw if isinstance(raw, list) else []:
+    def ensure(self) -> None:
+        self.pml_dir.mkdir(parents=True, exist_ok=True)
+
+
+class SingleInstanceLock:
+    def __init__(self, lock_path: Path):
+        self.lock_path = lock_path
+
+    def acquire(self) -> None:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.lock_path.exists():
             try:
-                steps.append(PMLStep(**obj))
+                data = json.loads(self.lock_path.read_text(encoding="utf-8"))
             except Exception:
-                continue
-        return steps
+                data = {}
+            raise RuntimeError(
+                f"Lock exists at {self.lock_path}. Another run might be active. lock={data}"
+            )
+        self.lock_path.write_text(jdump({"pid": os.getpid(), "ts": now()}), encoding="utf-8")
 
-    def save(self, steps: List[PMLStep]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        data = [dataclasses.asdict(s) for s in steps]
-        atomic_write_json(self.path, data)
+    def release(self) -> None:
+        try:
+            self.lock_path.unlink(missing_ok=True)  # type: ignore[arg-type]
+        except Exception:
+            pass
 
-    def ensure_seed(self) -> List[PMLStep]:
-        steps = self.load()
-        if steps:
-            return steps
-        seed = [
-            PMLStep(
-                id="spec-0001",
-                title="Define PML goals and non-goals",
-                goal="Write a crisp list of PML goals, non-goals, and constraints. Save under pml/specs/goals.md.",
-                phase="spec",
-                mode="docs",
-            ),
-            PMLStep(
-                id="spec-0002",
-                title="Draft minimal syntax",
-                goal="Draft a minimal PML syntax (module/type/fn/import/let/effects) in pml/docs/01_syntax.md, keeping it short but explicit.",
-                phase="spec",
-                mode="docs",
-            ),
-            PMLStep(
-                id="compiler-0001",
-                title="Scaffold compiler modules",
-                goal="Create placeholder compiler modules under pml/compiler (lexer.py, parser.py, ast.py, emit_py.py, cli.py).",
-                phase="compiler",
-                mode="code",
-            ),
-            PMLStep(
-                id="runtime-0001",
-                title="Scaffold runtime",
-                goal="Create minimal runtime package under pml/runtime (init, fs helpers placeholders, safe exec placeholders).",
-                phase="runtime",
-                mode="code",
-            ),
-            PMLStep(
-                id="examples-0001",
-                title="Add a small example program",
-                goal="Create a small example PML program in pml/examples and describe expected Python output.",
-                phase="examples",
-                mode="docs",
-            ),
+
+class HealthMonitor:
+    def __init__(self, cfg: AppConfig, paths: ProjectPaths):
+        self.cfg = cfg
+        self.paths = paths
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self.psutil = try_import_psutil()
+
+    def start(self) -> None:
+        if not self.cfg.monitor:
+            return
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _gpu_stats(self) -> Dict[str, Any]:
+        cmd = [
+            "nvidia-smi",
+            "--query-gpu=temperature.gpu,memory.used,memory.total,utilization.gpu",
+            "--format=csv,noheader,nounits",
         ]
-        self.save(seed)
-        return seed
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if p.returncode != 0:
+                return {"ok": False, "err": (p.stderr or "").strip()[:200]}
+            line = (p.stdout or "").strip().splitlines()[0]
+            parts = [x.strip() for x in line.split(",")]
+            temp = int(parts[0])
+            mem_used = int(parts[1])
+            mem_total = int(parts[2])
+            util = int(parts[3])
+            return {
+                "ok": True,
+                "temp_c": temp,
+                "mem_used_mb": mem_used,
+                "mem_total_mb": mem_total,
+                "util_pct": util,
+            }
+        except Exception:
+            return {"ok": False, "err": "nvidia-smi unavailable"}
 
-    def pick_next(self, steps: List[PMLStep]) -> Optional[PMLStep]:
-        pending = [s for s in steps if s.status in ("pending", "failed")]
-        if not pending:
-            return None
-        # prefer spec/docs early
-        def key(s: PMLStep) -> Tuple[int, float]:
-            pr = {"spec": 0, "docs": 1, "compiler": 2, "runtime": 3, "examples": 4}.get(s.phase, 5)
-            return pr, s.created_at
+    def _cpu_ram_stats(self) -> Dict[str, Any]:
+        if not self.psutil:
+            return {"ok": False, "err": "psutil not installed"}
+        try:
+            cpu = float(self.psutil.cpu_percent(interval=None))
+            vm = self.psutil.virtual_memory()
+            return {
+                "ok": True,
+                "cpu_pct": cpu,
+                "ram_pct": float(vm.percent),
+                "ram_used_gb": round(vm.used / (1024**3), 2),
+                "ram_total_gb": round(vm.total / (1024**3), 2),
+            }
+        except Exception as e:
+            return {"ok": False, "err": str(e)}
 
-        pending.sort(key=key)
-        return pending[0]
+    def _disk_stats(self) -> Dict[str, Any]:
+        try:
+            usage = shutil.disk_usage(self.paths.base_dir)
+            return {
+                "ok": True,
+                "free_gb": round(usage.free / (1024**3), 2),
+                "total_gb": round(usage.total / (1024**3), 2),
+            }
+        except Exception as e:
+            return {"ok": False, "err": str(e)}
 
-    def upsert(self, steps: List[PMLStep], step: PMLStep) -> List[PMLStep]:
-        out: List[PMLStep] = []
-        replaced = False
-        for s in steps:
-            if s.id == step.id:
-                out.append(step)
-                replaced = True
-            else:
-                out.append(s)
-        if not replaced:
-            out.append(step)
-        return out
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            stats = {
+                "ts": now(),
+                "cpu": self._cpu_ram_stats(),
+                "gpu": self._gpu_stats(),
+                "disk": self._disk_stats(),
+            }
+            try:
+                self.paths.pml_dir.mkdir(parents=True, exist_ok=True)
+                self.paths.heartbeat_path.write_text(jdump(stats), encoding="utf-8")
+            except Exception:
+                pass
 
+            gpu = stats.get("gpu") or {}
+            temp = gpu.get("temp_c") if gpu.get("ok") else None
 
-# --------------------------------------------------------------------------------------
-# Memory + RAG
-# --------------------------------------------------------------------------------------
-
-
-class MemoryStore:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        ensure_pml_layout()
-
-    def append(self, record: Dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    def load_recent(self, limit: int = 400) -> List[Dict[str, Any]]:
-        if not self.path.exists():
-            return []
-        rows: List[Dict[str, Any]] = []
-        with self.path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rows.append(json.loads(line))
-                except Exception:
-                    continue
-        return rows[-limit:]
-
-    @staticmethod
-    def _tokens(text: str) -> List[str]:
-        # cheap tokenization for similarity — good enough for now
-        t = re.sub(r"[^a-zA-Z0-9_\s]", " ", (text or "").lower())
-        parts = [p for p in t.split() if len(p) >= 4]
-        return parts[:800]
-
-    def search(self, query: str, k: int = 6) -> List[Dict[str, Any]]:
-        rows = self.load_recent(limit=600)
-        if not rows:
-            return []
-        q = set(self._tokens(query))
-        if not q:
-            return []
-        scored: List[Tuple[float, Dict[str, Any]]] = []
-        for r in rows:
-            txt = (r.get("goal", "") + " " + r.get("answer", ""))[:8000]
-            s = set(self._tokens(txt))
-            if not s:
+            if isinstance(temp, int) and temp >= self.cfg.max_gpu_temp_c:
+                log(
+                    f"[HEALTH] GPU temp high ({temp}°C >= {self.cfg.max_gpu_temp_c}°C). Cooling {self.cfg.cooldown_s}s"
+                )
+                slept = 0
+                while slept < self.cfg.cooldown_s and not self._stop.is_set():
+                    time.sleep(1)
+                    slept += 1
                 continue
-            inter = q.intersection(s)
-            if not inter:
-                continue
-            score = len(inter) / max(1, len(q))
-            scored.append((score, r))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [r for _, r in scored[:k]]
+
+            time.sleep(self.cfg.monitor_interval_s)
 
 
-def format_rag(hits: List[Dict[str, Any]], max_chars: int = 2000) -> str:
-    if not hits:
-        return "No relevant memory."
-    out: List[str] = []
-    for h in hits:
-        sid = h.get("step_id", "?")
-        title = h.get("title", "")
-        goal = (h.get("goal", "") or "")[:300]
-        ans = (h.get("answer", "") or "")[:600]
-        out.append(f"- {sid}: {title}\n  goal: {goal}\n  result: {ans}")
-    txt = "\n\n".join(out)
-    return txt[:max_chars]
-
-
-def format_index_snippets(index_obj: Dict[str, Any], max_files: int = 12) -> str:
-    files = index_obj.get("files") or []
-    if not isinstance(files, list) or not files:
-        return "(no index yet)"
-    out: List[str] = []
-    for f in files[:max_files]:
-        p = f.get("path")
-        head = (f.get("head") or "").strip().replace("\n", " ")
-        out.append(f"- {p}: {head[:240]}")
-    return "\n".join(out)
-
-
-# --------------------------------------------------------------------------------------
-# LM Studio client (persistent session + optional streaming)
-# --------------------------------------------------------------------------------------
-
-
-class LMClient:
-    def __init__(self, url: str, model: str, *, ssl_verify: bool = DEFAULT_SSL_VERIFY) -> None:
-        self.url = url
-        self.model = model
-        self.ssl_verify = ssl_verify
+class LMStudioClient:
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
 
-    def _payload(
+    def _request(self, payload: Dict[str, Any]) -> requests.Response:
+        t0 = now()
+        log(
+            f"[LM] POST -> {self.cfg.lm_url} | max_tokens={payload.get('max_tokens')}, temp={payload.get('temperature')}, top_p={payload.get('top_p')}, stream={payload.get('stream')}"
+        )
+        resp = self.session.post(
+            self.cfg.lm_url,
+            json=payload,
+            timeout=self.cfg.timeout_s,
+            verify=self.cfg.ssl_verify,
+            stream=bool(payload.get("stream")),
+        )
+        dt = now() - t0
+        log(f"[LM] Response status: {resp.status_code} in {dt:.2f}s")
+        return resp
+
+    def chat(
         self,
         messages: List[Dict[str, str]],
         *,
@@ -871,388 +255,695 @@ class LMClient:
         temperature: float,
         top_p: float,
         stream: bool,
-    ) -> Dict[str, Any]:
-        return {
-            "model": self.model,
+    ) -> str:
+        payload: Dict[str, Any] = {
+            "model": self.cfg.lm_model,
             "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "stream": stream,
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "stream": bool(stream),
         }
 
-    def chat(
-        self,
-        messages: List[Dict[str, str]],
-        *,
-        max_tokens: int = DEFAULT_MAX_TOKENS,
-        temperature: float = DEFAULT_TEMPERATURE,
-        top_p: float = DEFAULT_TOP_P,
-        stream: bool = False,
-    ) -> str:
-        payload = self._payload(
-            messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            stream=stream,
-        )
+        resp = self._request(payload)
+
+        if resp.status_code >= 400:
+            try:
+                body = resp.text[:4000]
+            except Exception:
+                body = ""
+            raise requests.HTTPError(
+                f"{resp.status_code} {resp.reason} from LM Studio. Body (truncated): {body}",
+                response=resp,
+            )
 
         if not stream:
-            LOG.log(f"[LM] POST -> {self.url} | max_tokens={max_tokens}, temp={temperature}, top_p={top_p}")
-            t0 = time.time()
-            resp = self.session.post(self.url, json=payload, timeout=None, verify=self.ssl_verify)
-            dt = time.time() - t0
-            LOG.log(f"[LM] Response status: {resp.status_code} in {dt:.2f}s")
-            resp.raise_for_status()
             data = resp.json()
-            return str(data["choices"][0]["message"]["content"])
+            return data["choices"][0]["message"]["content"]
 
-        # streaming
-        LOG.log(f"[LM] STREAM POST -> {self.url} | max_tokens={max_tokens}")
-        t0 = time.time()
-        resp = self.session.post(self.url, json=payload, timeout=None, verify=self.ssl_verify, stream=True)
-        dt0 = time.time() - t0
-        LOG.log(f"[LM] Stream status: {resp.status_code} (ttfb={dt0:.2f}s)")
-        resp.raise_for_status()
-
-        content_parts: List[str] = []
-        for raw_line in resp.iter_lines(decode_unicode=True):
-            if not raw_line:
+        out = []
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
                 continue
-            line = raw_line.strip()
             if line.startswith("data:"):
                 line = line[len("data:") :].strip()
             if line == "[DONE]":
                 break
             try:
-                obj = json.loads(line)
-                delta = obj.get("choices", [{}])[0].get("delta", {}).get("content")
-                if delta:
-                    content_parts.append(str(delta))
-                    # live output so terminal isn't blank
-                    sys.stdout.write(str(delta))
-                    sys.stdout.flush()
+                chunk = json.loads(line)
             except Exception:
-                # Some servers emit non-JSON keep-alives
                 continue
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            token = delta.get("content")
+            if token:
+                out.append(token)
+                sys.stdout.write(token)
+                sys.stdout.flush()
+        return "".join(out)
 
-        LOG.log(f"\n[LM] Stream finished in {time.time() - t0:.2f}s")
-        return "".join(content_parts)
+
+class TokenBudgeter:
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+
+    def estimate_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return max(1, int(len(text) / 4))
+
+    def estimate_messages(self, messages: List[Dict[str, str]]) -> int:
+        total = 0
+        for m in messages:
+            total += self.estimate_tokens(m.get("content", "")) + 8
+        return total
+
+    def shrink_text(self, text: str, max_chars: int) -> str:
+        if len(text) <= max_chars:
+            return text
+        head = text[: max_chars // 2]
+        tail = text[-max_chars // 2 :]
+        return head + "\n…<snip>…\n" + tail
+
+    def fit(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        reserve_output_tokens: int,
+        max_workspace_chars: int,
+        max_rag_chars: int,
+    ) -> List[Dict[str, str]]:
+        ctx = int(self.cfg.ctx_len)
+        reserve = int(reserve_output_tokens)
+        if reserve >= ctx:
+            reserve = max(256, ctx // 2)
+
+        def _hard_trim(ms: List[Dict[str, str]]) -> List[Dict[str, str]]:
+            trimmed: List[Dict[str, str]] = []
+            for i, m in enumerate(ms):
+                c = m.get("content", "")
+                if i == 0 and m.get("role") == "system":
+                    trimmed.append({"role": "system", "content": self.shrink_text(c, 3000)})
+                    continue
+                if "PML workspace" in c:
+                    trimmed.append({"role": m.get("role", "system"), "content": self.shrink_text(c, max_workspace_chars)})
+                elif c.startswith("Relevant memory"):
+                    trimmed.append({"role": m.get("role", "system"), "content": self.shrink_text(c, max_rag_chars)})
+                else:
+                    trimmed.append({"role": m.get("role", "user"), "content": self.shrink_text(c, 6000)})
+            return trimmed
+
+        ms = _hard_trim(messages)
+        budget = ctx - reserve
+        if budget < 512:
+            budget = 512
+
+        while self.estimate_messages(ms) > budget:
+            if len(ms) <= 2:
+                ms = _hard_trim(ms)
+                break
+            removed = False
+            for i in range(1, len(ms) - 1):
+                if ms[i].get("role") == "system":
+                    ms.pop(i)
+                    removed = True
+                    break
+            if removed:
+                continue
+            ms.pop(1)
+
+        return ms
 
 
-# --------------------------------------------------------------------------------------
-# JSON extraction / action normalization
-# --------------------------------------------------------------------------------------
+class ProjectDB:
+    def __init__(self, db_path: Path):
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA temp_store=MEMORY")
+        self._init_schema()
+        self._lock = threading.Lock()
 
-
-def extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
-    if not text:
-        return None
-
-    # Fast path: raw JSON
-    s = text.strip()
-    if s.startswith("{") and s.endswith("}"):
+    def close(self) -> None:
         try:
-            obj = json.loads(s)
-            return obj if isinstance(obj, dict) else None
+            self.conn.close()
         except Exception:
             pass
 
-    # Remove code fences (common)
-    s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)
-    s = re.sub(r"```\s*$", "", s)
-
-    # Try to find a balanced JSON object
-    start = s.find("{")
-    if start == -1:
-        return None
-
-    depth = 0
-    in_str = False
-    esc = False
-    for i in range(start, len(s)):
-        ch = s[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        else:
-            if ch == '"':
-                in_str = True
-                continue
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = s[start : i + 1]
-                    try:
-                        obj = json.loads(candidate)
-                        return obj if isinstance(obj, dict) else None
-                    except Exception:
-                        return None
-    return None
-
-
-def normalize_action_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
-    if "action" in obj:
-        return obj
-    schema = obj.get("action_schema")
-    if isinstance(schema, dict) and "action" in schema:
-        LOG.log("[AGENT] Normalizing action_schema wrapper from model.")
-        return schema
-    return obj
-
-
-# --------------------------------------------------------------------------------------
-# Brainstormer (creates steps when queue is empty)
-# --------------------------------------------------------------------------------------
-
-
-class Brainstormer:
-    def __init__(self, lm: LMClient, memory: MemoryStore) -> None:
-        self.lm = lm
-        self.memory = memory
-
-    def propose_steps(self, count: int = 10) -> List[PMLStep]:
-        recent = self.memory.load_recent(limit=60)
-        digest: List[str] = []
-        for r in recent[-10:]:
-            digest.append(
-                f"- {r.get('step_id','?')} [{r.get('phase','?')}] {r.get('title','')}: {str(r.get('answer',''))[:120]}"
+    def _init_schema(self) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts REAL NOT NULL,
+              prompt TEXT NOT NULL,
+              answer TEXT NOT NULL,
+              meta TEXT NOT NULL
             )
-        hist = "\n".join(digest) if digest else "(no memory yet)"
-
-        system = (
-            "You are a ruthless backlog generator for PML (Project Me Language). "
-            "Generate concrete, implementable steps that move the language forward. "
-            "Prefer small steps with real code/doc outputs, not vague research. "
-            "All work MUST stay under ./pml.\n\n"
-            "Return ONLY a JSON list of objects: "
-            "[{id,title,goal,phase,mode}, ...]. "
-            "id must be unique and follow prefix like spec-XXXX, compiler-XXXX, runtime-XXXX, docs-XXXX, examples-XXXX."
+            """
         )
-
-        user = (
-            f"Recent progress:\n{hist}\n\n"
-            f"Generate {count} next steps. Mix spec/docs/compiler/runtime/examples. "
-            "Make them non-overlapping. Keep them deterministic: each step must name the exact file(s) to edit/create."
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS steps (
+              id TEXT PRIMARY KEY,
+              phase TEXT NOT NULL,
+              title TEXT NOT NULL,
+              body TEXT NOT NULL,
+              status TEXT NOT NULL,
+              created REAL NOT NULL,
+              updated REAL NOT NULL
+            )
+            """
         )
-
-        raw = self.lm.chat(
-            [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            max_tokens=1500,
-            temperature=0.3,
-            top_p=0.9,
-            stream=False,
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts REAL NOT NULL,
+              kind TEXT NOT NULL,
+              payload TEXT NOT NULL
+            )
+            """
         )
-
-        # Parse list
-        data: Any = None
         try:
-            data = json.loads(raw)
+            cur.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
+                USING fts5(prompt, answer, content='memory', content_rowid='id')
+                """
+            )
+            cur.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory BEGIN
+                  INSERT INTO memory_fts(rowid, prompt, answer) VALUES (new.id, new.prompt, new.answer);
+                END;
+                CREATE TRIGGER IF NOT EXISTS memory_ad AFTER DELETE ON memory BEGIN
+                  INSERT INTO memory_fts(memory_fts, rowid, prompt, answer) VALUES ('delete', old.id, old.prompt, old.answer);
+                END;
+                CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory BEGIN
+                  INSERT INTO memory_fts(memory_fts, rowid, prompt, answer) VALUES ('delete', old.id, old.prompt, old.answer);
+                  INSERT INTO memory_fts(rowid, prompt, answer) VALUES (new.id, new.prompt, new.answer);
+                END;
+                """
+            )
         except Exception:
-            start = raw.find("[")
-            end = raw.rfind("]")
-            if start != -1 and end != -1 and end > start:
-                data = json.loads(raw[start : end + 1])
+            pass
+        self.conn.commit()
 
-        out: List[PMLStep] = []
-        if not isinstance(data, list):
-            return out
+    def add_memory(self, prompt: str, answer: str, meta: Dict[str, Any]) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO memory(ts,prompt,answer,meta) VALUES (?,?,?,?)",
+                (now(), prompt, answer, json.dumps(meta, ensure_ascii=False)),
+            )
+            self.conn.commit()
 
-        for obj in data:
-            if not isinstance(obj, dict):
-                continue
+    def search_memory(self, query: str, k: int) -> List[Dict[str, Any]]:
+        q = (query or "").strip()
+        if not q:
+            return []
+
+        with self._lock:
             try:
-                out.append(
-                    PMLStep(
-                        id=str(obj["id"]),
-                        title=str(obj["title"]),
-                        goal=str(obj["goal"]),
-                        phase=str(obj.get("phase", "spec")),
-                        mode=str(obj.get("mode", "design")),
-                    )
+                cur = self.conn.execute(
+                    """
+                    SELECT m.prompt, m.answer, m.meta
+                    FROM memory_fts f
+                    JOIN memory m ON m.id = f.rowid
+                    WHERE memory_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    (self._fts_query(q), int(k)),
                 )
+                rows = cur.fetchall()
             except Exception:
-                continue
+                cur = self.conn.execute(
+                    "SELECT prompt, answer, meta FROM memory ORDER BY id DESC LIMIT ?",
+                    (int(k),),
+                )
+                rows = cur.fetchall()
+
+        out: List[Dict[str, Any]] = []
+        for p, a, meta in rows:
+            try:
+                meta_obj = json.loads(meta)
+            except Exception:
+                meta_obj = {}
+            out.append({"prompt": p, "answer": a, "meta": meta_obj})
         return out
 
+    def _fts_query(self, text: str) -> str:
+        tokens = [t for t in re.split(r"\W+", text.lower()) if len(t) >= 3]
+        if not tokens:
+            return text
+        tokens = tokens[:12]
+        return " OR ".join(tokens)
 
-# --------------------------------------------------------------------------------------
-# Safe execution layer for tools
-# --------------------------------------------------------------------------------------
+    def upsert_step(self, step_id: str, phase: str, title: str, body: str, status: str) -> None:
+        ts = now()
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO steps(id,phase,title,body,status,created,updated)
+                VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                  phase=excluded.phase,
+                  title=excluded.title,
+                  body=excluded.body,
+                  status=excluded.status,
+                  updated=excluded.updated
+                """,
+                (step_id, phase, title, body, status, ts, ts),
+            )
+            self.conn.commit()
+
+    def next_pending_step(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT id, phase, title, body, status FROM steps WHERE status='todo' ORDER BY created ASC LIMIT 1"
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "phase": row[1], "title": row[2], "body": row[3], "status": row[4]}
+
+    def mark_step(self, step_id: str, status: str) -> None:
+        with self._lock:
+            self.conn.execute(
+                "UPDATE steps SET status=?, updated=? WHERE id=?",
+                (status, now(), step_id),
+            )
+            self.conn.commit()
+
+    def list_steps(self, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT id, phase, title, status, created, updated FROM steps ORDER BY created DESC LIMIT ?",
+                (int(limit),),
+            )
+            rows = cur.fetchall()
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "id": r[0],
+                    "phase": r[1],
+                    "title": r[2],
+                    "status": r[3],
+                    "created": r[4],
+                    "updated": r[5],
+                }
+            )
+        return out
+
+    def add_event(self, kind: str, payload: Dict[str, Any]) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO events(ts,kind,payload) VALUES (?,?,?)",
+                (now(), kind, json.dumps(payload, ensure_ascii=False)),
+            )
+            self.conn.commit()
+
+
+class Workspace:
+    def __init__(self, paths: ProjectPaths):
+        self.paths = paths
+        self.exclude = {".git", ".venv", "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules"}
+
+    def safe_path(self, rel: str) -> Path:
+        p = (self.paths.base_dir / rel).resolve()
+        if not str(p).startswith(str(self.paths.base_dir.resolve())):
+            raise ValueError("Path escapes project root")
+        return p
+
+    def snapshot_tree(self, max_depth: int = 2, max_entries: int = 200) -> str:
+        base = self.paths.base_dir
+
+        def _walk(d: Path, depth: int) -> Iterable[str]:
+            if depth > max_depth:
+                return
+            try:
+                entries = sorted(d.iterdir(), key=lambda x: x.name.lower())
+            except Exception:
+                return
+            for e in entries:
+                if e.name in self.exclude:
+                    continue
+                rel = str(e.relative_to(base)).replace("\\", "/")
+                if e.is_dir():
+                    yield f"{rel}/"
+                    yield from _walk(e, depth + 1)
+                else:
+                    yield rel
+
+        out = []
+        for i, line in enumerate(_walk(base, 0)):
+            if i >= max_entries:
+                out.append("… (tree truncated) …")
+                break
+            out.append(line)
+        return "\n".join(out)
 
 
 class ToolRunner:
-    def __init__(self) -> None:
-        self.tools = TOOLS
+    def __init__(self, cfg: AppConfig, ws: Workspace):
+        self.cfg = cfg
+        self.ws = ws
+
+    def list_dir(self, path: str = ".") -> Dict[str, Any]:
+        p = self.ws.safe_path(path)
+        items = []
+        for child in sorted(p.iterdir(), key=lambda x: x.name.lower()):
+            if child.name in self.ws.exclude:
+                continue
+            try:
+                st = child.stat()
+                size = st.st_size
+            except Exception:
+                size = 0
+            items.append({"name": child.name, "is_dir": child.is_dir(), "size": size})
+        return {"cwd": str(p), "items": items}
+
+    def read_file(self, path: str, max_chars: int = 12000) -> Dict[str, Any]:
+        p = self.ws.safe_path(path)
+        if not p.exists() or not p.is_file():
+            raise FileNotFoundError(str(p))
+        data = p.read_text(encoding="utf-8", errors="ignore")
+        truncated = False
+        if len(data) > max_chars:
+            truncated = True
+            data = data[:max_chars]
+        return {"path": str(p), "content": data, "truncated": truncated}
+
+    def write_file(self, path: str, content: str, append: bool = False) -> Dict[str, Any]:
+        p = self.ws.safe_path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        mode = "a" if append else "w"
+        with p.open(mode, encoding="utf-8") as f:
+            f.write(content)
+        return {"path": str(p), "bytes": len(content), "append": append}
+
+    def mkdir(self, path: str, exist_ok: bool = True) -> Dict[str, Any]:
+        p = self.ws.safe_path(path)
+        p.mkdir(parents=True, exist_ok=exist_ok)
+        return {"path": str(p), "exists": True}
+
+    def move_path(self, src: str, dst: str) -> Dict[str, Any]:
+        s = self.ws.safe_path(src)
+        d = self.ws.safe_path(dst)
+        d.parent.mkdir(parents=True, exist_ok=True)
+        s.rename(d)
+        return {"src": str(s), "dst": str(d)}
+
+    def delete_path(self, path: str, recursive: bool = False) -> Dict[str, Any]:
+        if self.cfg.safe_mode and not self.cfg.auto_approve:
+            raise PermissionError("delete_path blocked: safe_mode without auto_approve")
+        p = self.ws.safe_path(path)
+        if p == self.ws.paths.base_dir:
+            raise ValueError("Refusing to delete project root")
+        if p.is_dir():
+            if not recursive:
+                p.rmdir()
+            else:
+                for child in sorted(p.rglob("*"), reverse=True):
+                    if child.is_file():
+                        child.unlink(missing_ok=True)  # type: ignore[arg-type]
+                    else:
+                        child.rmdir()
+                p.rmdir()
+        elif p.exists():
+            p.unlink()
+        return {"path": str(p), "deleted": True}
+
+    def run_shell(self, cmd: str, timeout: Optional[int] = None) -> Dict[str, Any]:
+        if self.cfg.safe_mode and not self.cfg.auto_approve:
+            raise PermissionError("run_shell blocked: safe_mode without auto_approve")
+        cmd_strip = (cmd or "").strip()
+        if not cmd_strip:
+            raise ValueError("Empty cmd")
+
+        allowed_prefixes = (
+            "python",
+            "py",
+            "pytest",
+            "pip",
+            "uv",
+            "dir",
+            "ls",
+            "type",
+            "cat",
+            "echo",
+            "git",
+        )
+        first = cmd_strip.split()[0].lower()
+        if not any(first.startswith(p) for p in allowed_prefixes):
+            raise ValueError("Command not allowed by allowlist")
+
+        p = subprocess.run(
+            cmd_strip,
+            shell=True,
+            cwd=str(self.ws.paths.base_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return {
+            "cmd": cmd_strip,
+            "returncode": p.returncode,
+            "stdout": (p.stdout or "")[-4000:],
+            "stderr": (p.stderr or "")[-4000:],
+        }
+
+    def git_status(self) -> Dict[str, Any]:
+        return self.run_shell("git status", timeout=60)
+
+    def git_commit_push(self, message: str) -> Dict[str, Any]:
+        if not self.cfg.git_auto:
+            return {"ok": False, "error": "git_auto disabled"}
+        msg = (message or "auto").strip()[:120]
+        r1 = self.run_shell("git add -A", timeout=120)
+        r2 = self.run_shell(f"git commit -m \"{msg}\"", timeout=120)
+        out = {"add": r1, "commit": r2}
+        if self.cfg.git_push:
+            r3 = self.run_shell("git push", timeout=300)
+            out["push"] = r3
+        return out
+
+    def tools_schema(self) -> str:
+        return (
+            "Available tools (call instead of guessing):\n"
+            "- list_dir {path?: str='.'}\n"
+            "- read_file {path: str, max_chars?: int}\n"
+            "- write_file {path: str, content: str, append?: bool}\n"
+            "- mkdir {path: str}\n"
+            "- move_path {src: str, dst: str}\n"
+            "- delete_path {path: str, recursive?: bool}\n"
+            "- run_shell {cmd: str, timeout?: int|null} (allowlist: python/py/pytest/pip/uv/dir/ls/type/cat/echo/git)\n"
+            "- git_status {}\n"
+            "- git_commit_push {message: str}\n"
+        )
 
     def run(self, tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any]:
-        fn = self.tools.get(tool_name)
-        if fn is None:
+        fn = getattr(self, tool_name, None)
+        if not callable(fn):
             return {"ok": False, "error": f"Unknown tool: {tool_name}"}
         try:
-            result = fn(**tool_args)
-            return {"ok": True, "result": result}
+            res = fn(**(tool_args or {}))
+            return {"ok": True, "result": res}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
 
-# --------------------------------------------------------------------------------------
-# PML agent: planning -> execution -> critique -> repair
-# --------------------------------------------------------------------------------------
+def extract_first_json_obj(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                snippet = text[start : i + 1]
+                try:
+                    obj = json.loads(snippet)
+                    if isinstance(obj, dict):
+                        return obj
+                except Exception:
+                    return None
+    return None
 
 
-class PMLAgent:
+def normalize_action(obj: Dict[str, Any]) -> Dict[str, Any]:
+    if "action" in obj:
+        return obj
+    schema = obj.get("action_schema")
+    if isinstance(schema, dict) and "action" in schema:
+        log("[AGENT] Normalizing action_schema wrapper")
+        return schema
+    return obj
+
+
+class Agent:
     def __init__(
         self,
-        lm: LMClient,
-        memory: MemoryStore,
-        steps: StepStore,
-        docs: PMLDocs,
-        tool_runner: ToolRunner,
-        health: HealthMonitor,
-        *,
-        stream: bool = False,
-    ) -> None:
+        cfg: AppConfig,
+        lm: LMStudioClient,
+        db: ProjectDB,
+        ws: Workspace,
+        tools: ToolRunner,
+    ):
+        self.cfg = cfg
         self.lm = lm
-        self.memory = memory
-        self.steps_store = steps
-        self.docs = docs
-        self.tools = tool_runner
-        self.health = health
-        self.stream = stream
+        self.db = db
+        self.ws = ws
+        self.tools = tools
+        self.budgeter = TokenBudgeter(cfg)
 
-    def _system_prompt(self) -> str:
-        tools_text = (
-            "Available tools (use them; do NOT guess file contents):\n"
-            "- list_dir {path?: str='.'}\n"
-            "- tree {path?: str='pml', max_nodes?: int}\n"
-            "- read_file {path: str, max_chars?: int}\n"
-            "- write_file {path: str, content: str, append?: bool}\n"
-            "- mkdir {path: str, exist_ok?: bool}\n"
-            "- move_path {src: str, dst: str}\n"
-            "- delete_path {path: str, recursive?: bool}\n"
-            "- grep {path: str, pattern: str, max_hits?: int}\n"
-            "- hash_file {path: str}\n"
-            "- run_shell {cmd: str} (limited allowlist)\n\n"
-            "CRITICAL RULES:\n"
-            "- ONLY modify files under ./pml (language work).\n"
-            "- Prefer small diffs that compile/parse.\n"
-            "- Keep PML deterministic and compiler output stable.\n"
-            "- Always finish the step by returning action=final with a short summary and next suggestions.\n\n"
-            "OUTPUT FORMAT:\n"
-            "Return ONLY ONE JSON object per reply (no markdown, no extra keys).\n"
-            "Either:\n"
-            "  {\"action\":\"tool\",\"tool_name\":\"read_file\",\"tool_args\":{...},\"reasoning\":\"...\"}\n"
-            "or:\n"
-            "  {\"action\":\"final\",\"answer\":\"...\",\"reasoning\":\"...\"}\n"
-        )
+    def _system_prompt(self, mode: str) -> str:
+        role_hint = {
+            "bootstrap": "Bias: bootstrap multi-file Python projects with clean structure + tests.",
+            "refactor": "Bias: minimal-diff refactors; change the least, improve the most.",
+            "review": "Bias: review only; do not edit files unless asked.",
+            "pml": "Bias: evolve PML (a DSL that compiles to Python) and its runtime, but keep file-count small.",
+            "auto": "Bias: choose bootstrap/refactor/review dynamically.",
+        }.get(mode, "Bias: auto.")
 
         return (
-            "You are Project Me: a senior language designer and compiler engineer. "
-            "You are building PML (Project Me Language / Programmable Meta Language), "
-            "a DSL that compiles to Python for large, long-lived systems. "
-            "You must be pragmatic: start minimal, ship working compiler pieces early, and iterate.\n\n"
-            + tools_text
+            "You are Project Me: a senior full-stack engineer + systems architect.\n"
+            f"{role_hint}\n\n"
+            "Rules:\n"
+            "- ALWAYS use tools to inspect workspace before writing/renaming/deleting.\n"
+            "- Keep diffs minimal when editing existing code.\n"
+            "- Prefer few files. Avoid file explosions.\n"
+            "- Output EXACTLY ONE JSON object per message. No markdown, no extra text.\n\n"
+            + self.tools.tools_schema()
+            + "\nAction schema (choose ONE):\n"
+            + '{"action":"tool","tool_name":"list_dir","tool_args":{},"reasoning":"short"}\n'
+            + '{"action":"final","answer":"markdown answer","reasoning":"short"}\n'
         )
 
-    def _load_index(self) -> Dict[str, Any]:
-        if not PML_INDEX_PATH.exists():
-            return {}
-        try:
-            return json.loads(PML_INDEX_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+    def _rag_context(self, prompt: str) -> str:
+        hits = self.db.search_memory(prompt, k=self.cfg.rag_k)
+        if not hits:
+            return ""
+        chunks = []
+        for h in hits:
+            p = (h.get("prompt") or "")[:300]
+            a = (h.get("answer") or "")[:500]
+            chunks.append(f"Prompt: {p}\nAnswer: {a}")
+        txt = "\n\n".join(chunks)
+        if len(txt) > self.cfg.max_rag_chars:
+            txt = txt[: self.cfg.max_rag_chars] + "\n…(rag truncated)…"
+        return txt
 
-    def _prepare_context(self, step: PMLStep) -> List[Dict[str, str]]:
-        self.docs.ensure_skeleton()
-        self.docs.update_workspace_index(max_files=500)
-
-        rag_hits = self.memory.search(step.goal, k=6)
-        rag_txt = format_rag(rag_hits, max_chars=2500)
-
-        tree_obj = tool_tree("pml", max_nodes=700)
-        tree_txt = tree_obj.get("tree", "")
-
-        idx = self._load_index()
-        idx_snips = format_index_snippets(idx, max_files=12)
-
-        messages: List[Dict[str, str]] = [
-            {"role": "system", "content": self._system_prompt()},
-            {"role": "system", "content": "PML workspace tree:\n" + (tree_txt or "(empty)")},
-            {"role": "system", "content": "Workspace index snippets:\n" + (idx_snips or "(none)")},
-            {"role": "system", "content": "Relevant memory (RAG):\n" + rag_txt},
-            {
-                "role": "user",
-                "content": (
-                    f"Execute this PML step now.\n"
-                    f"id: {step.id}\n"
-                    f"phase: {step.phase}\n"
-                    f"mode: {step.mode}\n"
-                    f"title: {step.title}\n"
-                    f"goal: {step.goal}\n\n"
-                    "Start by inspecting needed files/folders with tools. "
-                    "Then implement changes. End with action=final summarizing what was done and what's next."
-                ),
-            },
-        ]
-        return messages
+    def _workspace_context(self) -> str:
+        tree = self.ws.snapshot_tree(max_depth=2, max_entries=160)
+        if len(tree) > self.cfg.max_workspace_chars:
+            tree = tree[: self.cfg.max_workspace_chars] + "\n…(tree truncated)…"
+        return tree
 
     def _lm_call(self, messages: List[Dict[str, str]], *, max_tokens: int) -> str:
-        return self.lm.chat(
+        fitted = self.budgeter.fit(
             messages,
-            max_tokens=max_tokens,
-            temperature=DEFAULT_TEMPERATURE,
-            top_p=DEFAULT_TOP_P,
-            stream=self.stream,
+            reserve_output_tokens=max_tokens,
+            max_workspace_chars=self.cfg.max_workspace_chars,
+            max_rag_chars=self.cfg.max_rag_chars,
         )
 
-    def _apply_action_loop(self, step: PMLStep, messages: List[Dict[str, str]], *, max_calls: int) -> Tuple[str, List[Dict[str, Any]]]:
+        try:
+            return self.lm.chat(
+                fitted,
+                max_tokens=max_tokens,
+                temperature=self.cfg.temperature,
+                top_p=self.cfg.top_p,
+                stream=self.cfg.stream,
+            )
+        except requests.HTTPError as e:
+            msg = str(e)
+            if "context" in msg.lower() or "overflow" in msg.lower() or "n_ctx" in msg.lower():
+                log("[AGENT] Context overflow detected; retrying with aggressive trimming")
+                smaller = []
+                for m in fitted:
+                    if m.get("role") == "system" and (
+                        m.get("content", "").startswith("PML workspace")
+                        or m.get("content", "").startswith("Relevant memory")
+                    ):
+                        continue
+                    smaller.append(m)
+                smaller = self.budgeter.fit(
+                    smaller,
+                    reserve_output_tokens=max_tokens,
+                    max_workspace_chars=800,
+                    max_rag_chars=800,
+                )
+                return self.lm.chat(
+                    smaller,
+                    max_tokens=max_tokens,
+                    temperature=self.cfg.temperature,
+                    top_p=self.cfg.top_p,
+                    stream=self.cfg.stream,
+                )
+            raise
+
+    def run_action_loop(
+        self,
+        *,
+        prompt: str,
+        mode: str,
+        max_calls: int,
+        meta: Dict[str, Any],
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        system = self._system_prompt(mode)
+        ws_ctx = self._workspace_context()
+        rag = self._rag_context(prompt)
+
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": system},
+            {"role": "system", "content": "PML workspace tree:\n" + ws_ctx},
+        ]
+        if rag:
+            messages.append({"role": "system", "content": "Relevant memory (RAG):\n" + rag})
+        messages.append({"role": "user", "content": prompt})
+
         tool_calls: List[Dict[str, Any]] = []
         last_raw = ""
 
-        for call_i in range(1, max_calls + 1):
-            self.health.check_and_cool_if_overheated()
-
-            LOG.log(f"[AGENT] Step {step.id} LM call {call_i}/{max_calls}")
-            raw = self._lm_call(messages, max_tokens=DEFAULT_MAX_TOKENS)
+        for i in range(1, max_calls + 1):
+            log(f"[AGENT] LM call {i}/{max_calls}")
+            raw = self._lm_call(messages, max_tokens=self.cfg.max_tokens)
             last_raw = raw
+            log(f"[AGENT] Raw reply length={len(raw)} chars")
 
-            if self.stream:
-                # streaming already printed tokens; add newline boundary
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-
-            obj = extract_first_json_object(raw)
+            obj = extract_first_json_obj(raw)
             if not obj:
-                LOG.log("[AGENT] Could not parse JSON. Treating raw response as final.")
-                return raw.strip(), tool_calls
+                answer = raw.strip()
+                self.db.add_memory(prompt, answer, {**meta, "tool_calls": tool_calls, "mode": mode})
+                return answer, tool_calls
 
-            obj = normalize_action_obj(obj)
+            obj = normalize_action(obj)
             action = str(obj.get("action", "final")).lower()
 
             if action == "final":
-                ans = str(obj.get("answer", "") or "").strip()
-                if not ans:
-                    ans = raw.strip()
-                return ans, tool_calls
+                answer = str(obj.get("answer") or "").strip() or raw.strip()
+                self.db.add_memory(prompt, answer, {**meta, "tool_calls": tool_calls, "mode": mode})
+                return answer, tool_calls
 
             if action == "tool":
-                tool_name = str(obj.get("tool_name", "")).strip()
-                tool_args = obj.get("tool_args") or {}
+                tool_name = str(obj.get("tool_name") or "")
+                tool_args = obj.get("tool_args")
                 if not isinstance(tool_args, dict):
                     tool_args = {}
+                log(f"[AGENT] Tool requested: {tool_name} args={tool_args}")
 
-                LOG.log(f"[AGENT] Tool requested: {tool_name} args={tool_args}")
                 result = self.tools.run(tool_name, tool_args)
-                tool_calls.append({"tool": tool_name, "args": tool_args, "result": result})
+                tool_calls.append({"i": i, "tool": tool_name, "args": tool_args, "result": result})
 
                 messages.append(
                     {
@@ -1263,360 +954,612 @@ class PMLAgent:
                 messages.append(
                     {
                         "role": "user",
-                        "content": (
-                            "Tool result:\n```json\n"
-                            + json.dumps(result, indent=2, ensure_ascii=False)
-                            + "\n```\n"
-                            "Continue the same step. If enough work is done, return action=final."
-                        ),
+                        "content": "Tool result:\n```json\n" + json.dumps(result, indent=2) + "\n```\n"
+                        "Use this observation. Either call another tool or return action=final.",
                     }
                 )
                 continue
 
-            LOG.log(f"[AGENT] Unknown action='{action}', returning raw.")
-            return raw.strip(), tool_calls
+            answer = raw.strip()
+            self.db.add_memory(prompt, answer, {**meta, "tool_calls": tool_calls, "mode": mode})
+            return answer, tool_calls
 
-        LOG.log("[AGENT] Max calls reached, returning last raw.")
-        return last_raw.strip(), tool_calls
+        answer = last_raw.strip()
+        self.db.add_memory(prompt, answer, {**meta, "tool_calls": tool_calls, "mode": mode, "max_calls": max_calls})
+        return answer, tool_calls
 
-    def _critique_and_patch(self, step: PMLStep, final_answer: str) -> Optional[str]:
-        # A lightweight self-critique pass that ONLY edits docs/specs if needed.
-        # This is intentionally conservative to avoid infinite rework.
-        system = (
-            "You are a strict reviewer for PML changes. "
-            "Given the step output and the current workspace, find obvious gaps/bugs and propose minimal fixes. "
-            "If fixes are needed, use tools to apply them. If not, return final with 'No changes'. "
-            "Output ONE JSON object only."
+
+PML_DOCS = """# PML (Project Me Language)
+
+PML is a tiny, practical DSL whose purpose is to **describe large, long-lived software systems** at a higher level than Python, while still compiling into **plain Python**.
+
+## Design goals
+- Human-readable enough to review, but structured enough for the agent to transform.
+- Compiles into Python packages with tests.
+- Encourages explicit modules, interfaces, and contracts.
+- Keeps files minimal (prefer a few well-named modules over file explosions).
+
+## Core concepts
+- **Unit**: a module or component.
+- **Contract**: interface + invariants.
+- **Pipeline**: ordered execution phases.
+- **Step**: atomic iteration task the agent executes.
+
+## Step JSON format
+`pml/steps.json` is the agent’s work queue.
+Each item is:
+```json
+{
+  "id": "runtime-0001",
+  "phase": "runtime",
+  "title": "Scaffold runtime",
+  "body": "What to build/change and acceptance criteria",
+  "status": "todo"
+}
+```
+
+## Runtime principle
+The agent should:
+1. Read current workspace.
+2. Execute exactly one step.
+3. Save progress immediately.
+4. Auto-generate new steps when queue is empty.
+
+"""
+
+
+def default_seed_steps() -> List[Dict[str, Any]]:
+    return [
+        {
+            "id": "runtime-0001",
+            "phase": "runtime",
+            "title": "Bootstrap PML runtime inside this repo",
+            "body": "Ensure pml/ exists, pml.db exists, and the CLI can run pml-loop safely for days. Keep files minimal.",
+            "status": "todo",
+        },
+        {
+            "id": "spec-0001",
+            "phase": "spec",
+            "title": "Define PML syntax sketch",
+            "body": "Write a compact syntax sketch: modules, contracts, pipelines. Store in pml/PML.md (append).",
+            "status": "todo",
+        },
+        {
+            "id": "compiler-0001",
+            "phase": "compiler",
+            "title": "Compiler plan",
+            "body": "Design compilation pipeline to Python: parse -> IR -> emit. Keep it minimal. Define acceptance tests.",
+            "status": "todo",
+        },
+    ]
+
+
+class PMLSteps:
+    def __init__(self, paths: ProjectPaths, db: ProjectDB):
+        self.paths = paths
+        self.db = db
+
+    def init_files(self) -> None:
+        self.paths.ensure()
+        if not self.paths.docs_path.exists():
+            self.paths.docs_path.write_text(PML_DOCS, encoding="utf-8")
+        if not self.paths.steps_json_path.exists():
+            seed = default_seed_steps()
+            self.paths.steps_json_path.write_text(jdump(seed), encoding="utf-8")
+        self._import_steps_json()
+
+    def _import_steps_json(self) -> None:
+        try:
+            arr = json.loads(self.paths.steps_json_path.read_text(encoding="utf-8"))
+        except Exception:
+            arr = []
+        if not isinstance(arr, list):
+            arr = []
+        for it in arr:
+            if not isinstance(it, dict):
+                continue
+            sid = str(it.get("id") or "").strip()
+            phase = str(it.get("phase") or "pml").strip()
+            title = str(it.get("title") or sid).strip()
+            body = str(it.get("body") or "").strip()
+            status = str(it.get("status") or "todo").strip()
+            if not sid:
+                continue
+            if status not in {"todo", "doing", "done", "blocked"}:
+                status = "todo"
+            self.db.upsert_step(sid, phase, title, body, status)
+
+    def export_steps_json(self) -> None:
+        steps = self.db.list_steps(limit=2000)
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for s in steps:
+            sid = s["id"]
+            row = self._get_step_full(sid)
+            if row:
+                by_id[sid] = row
+        ordered = sorted(by_id.values(), key=lambda x: x["id"])
+        self.paths.steps_json_path.write_text(jdump(ordered), encoding="utf-8")
+
+    def _get_step_full(self, step_id: str) -> Optional[Dict[str, Any]]:
+        with self.db._lock:
+            cur = self.db.conn.execute(
+                "SELECT id, phase, title, body, status FROM steps WHERE id=?",
+                (step_id,),
+            )
+            r = cur.fetchone()
+        if not r:
+            return None
+        return {"id": r[0], "phase": r[1], "title": r[2], "body": r[3], "status": r[4]}
+
+
+class GitBackup:
+    def __init__(self, cfg: AppConfig, tools: ToolRunner):
+        self.cfg = cfg
+        self.tools = tools
+        self._last_push = 0.0
+
+    def maybe_commit(self, message: str) -> None:
+        if not self.cfg.git_auto:
+            return
+        if now() - self._last_push < self.cfg.git_interval_s:
+            return
+        self._last_push = now()
+        try:
+            log(f"[GIT] Auto backup: {message}")
+            res = self.tools.git_commit_push(message=message)
+            log(f"[GIT] Backup result: ok={res.get('add',{}).get('returncode',0)==0}")
+        except Exception as e:
+            log(f"[GIT] Backup failed: {e}")
+
+
+class PMLRunner:
+    def __init__(
+        self,
+        cfg: AppConfig,
+        paths: ProjectPaths,
+        db: ProjectDB,
+        agent: Agent,
+        tools: ToolRunner,
+        steps: PMLSteps,
+        git: GitBackup,
+    ):
+        self.cfg = cfg
+        self.paths = paths
+        self.db = db
+        self.agent = agent
+        self.tools = tools
+        self.steps = steps
+        self.git = git
+
+    def _append_runlog(self, record: Dict[str, Any]) -> None:
+        try:
+            self.paths.pml_dir.mkdir(parents=True, exist_ok=True)
+            with self.paths.runlog_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def _generate_more_steps(self, reason: str) -> None:
+        prompt = (
+            "Generate 8 new PML steps to progress the language and runtime. "
+            "Keep file-count small. Each step must be atomic and executable. "
+            "Return action=final where answer is a JSON array of step objects with keys: id, phase, title, body, status='todo'. "
+            f"Reason: {reason}"
+        )
+        answer, _ = self.agent.run_action_loop(
+            prompt=prompt,
+            mode="pml",
+            max_calls=2,
+            meta={"kind": "gen_steps", "reason": reason},
+        )
+        arr = None
+        try:
+            arr = json.loads(answer)
+        except Exception:
+            arr = None
+        if not isinstance(arr, list):
+            log("[PML] Step generator did not return a JSON array; skipping")
+            return
+        added = 0
+        for it in arr:
+            if not isinstance(it, dict):
+                continue
+            sid = str(it.get("id") or "").strip()
+            phase = str(it.get("phase") or "pml").strip()
+            title = str(it.get("title") or sid).strip()
+            body = str(it.get("body") or "").strip()
+            status = str(it.get("status") or "todo").strip()
+            if not sid or status != "todo":
+                continue
+            if len(sid) > 64:
+                continue
+            self.db.upsert_step(sid, phase, title, body, "todo")
+            added += 1
+        log(f"[PML] Added {added} new steps")
+        self.steps.export_steps_json()
+
+    def run_one_step(self, step: Dict[str, Any]) -> None:
+        sid = step["id"]
+        phase = step["phase"]
+        title = step["title"]
+        body = step["body"]
+
+        self.db.mark_step(sid, "doing")
+        self.steps.export_steps_json()
+
+        prompt = (
+            "Execute this PML step now.\n"
+            f"id: {sid}\nphase: {phase}\ntitle: {title}\n\n"
+            "Constraints:\n"
+            "- Keep file count small. Prefer updating existing files.\n"
+            "- Use tools for filesystem operations.\n"
+            "- At the end, return action=final with: (1) what changed, (2) what to do next, (3) any files edited.\n\n"
+            f"Step body:\n{body}\n"
         )
 
-        tree_txt = tool_tree("pml", max_nodes=450).get("tree", "")
-        messages: List[Dict[str, str]] = [
-            {"role": "system", "content": self._system_prompt()},
-            {"role": "system", "content": system},
-            {"role": "system", "content": "PML workspace tree:\n" + tree_txt},
-            {
-                "role": "user",
-                "content": (
-                    f"Step id: {step.id}\n"
-                    f"Title: {step.title}\n"
-                    f"Goal: {step.goal}\n\n"
-                    f"Step output:\n{final_answer}\n\n"
-                    "If you must patch something, do it now via tools. Otherwise return final='No changes'."
-                ),
-            },
-        ]
+        t0 = now()
+        answer, tool_calls = self.agent.run_action_loop(
+            prompt=prompt,
+            mode="pml",
+            max_calls=self.cfg.agent_calls,
+            meta={"kind": "pml_step", "step_id": sid, "phase": phase, "title": title},
+        )
+        dt = now() - t0
 
-        ans, _ = self._apply_action_loop(step, messages, max_calls=2)
-        if ans.strip().lower() in ("no changes", "no change", "nothing", "none"):
-            return None
-        return ans
+        self.db.mark_step(sid, "done")
+        self.steps.export_steps_json()
 
-    def run_one_step(self, *, agent_calls: int) -> bool:
-        self.docs.ensure_skeleton()
-        steps = self.steps_store.ensure_seed()
-        step = self.steps_store.pick_next(steps)
-
-        if step is None:
-            LOG.log("[PML] No pending steps. Generating more steps...")
-            gen = Brainstormer(self.lm, self.memory).propose_steps(count=12)
-            if not gen:
-                LOG.log("[PML] Brainstormer produced nothing. Idle.")
-                return False
-            steps.extend(gen)
-            self.steps_store.save(steps)
-            step = self.steps_store.pick_next(steps)
-            if step is None:
-                return False
-
-        step.status = "doing"
-        step.updated_at = time.time()
-        step.attempts += 1
-        steps = self.steps_store.upsert(steps, step)
-        self.steps_store.save(steps)
-
-        LOG.log(f"[PML] Working step={step.id} phase={step.phase} title={step.title}")
-
-        tool_calls: List[Dict[str, Any]] = []
-        final_answer = ""
-        ok = True
-
-        try:
-            messages = self._prepare_context(step)
-            final_answer, tool_calls = self._apply_action_loop(step, messages, max_calls=agent_calls)
-
-            # small self-critique / patch pass
-            patch_note = self._critique_and_patch(step, final_answer)
-            if patch_note:
-                final_answer += "\n\n---\n\nSelf-critique patches applied:\n" + patch_note
-
-            step.status = "done"
-            step.last_error = None
-            step.last_result = final_answer
-            step.updated_at = time.time()
-
-        except KeyboardInterrupt:
-            ok = False
-            step.status = "failed"
-            step.last_error = "Interrupted"
-            step.updated_at = time.time()
-            LOG.log("[PML] Interrupted.")
-
-        except Exception as e:
-            ok = False
-            step.status = "failed"
-            step.last_error = str(e)
-            step.updated_at = time.time()
-            LOG.exception(f"[PML] Step crashed: {e}")
-            crashlog(f"step={step.id} error={e}\n{traceback.format_exc()}")
-
-        steps = self.steps_store.load()
-        steps = self.steps_store.upsert(steps, step)
-        self.steps_store.save(steps)
-
-        mem_rec = {
-            "ts": time.time(),
-            "step_id": step.id,
-            "phase": step.phase,
-            "mode": step.mode,
-            "title": step.title,
-            "goal": step.goal,
-            "status": step.status,
-            "attempts": step.attempts,
-            "error": step.last_error,
-            "answer": final_answer,
-            "tools": tool_calls,
+        rec = {
+            "ts": now(),
+            "step_id": sid,
+            "phase": phase,
+            "title": title,
+            "seconds": round(dt, 3),
+            "tool_calls": tool_calls,
+            "answer_preview": answer[:800],
         }
-        self.memory.append(mem_rec)
+        self._append_runlog(rec)
+        self.db.add_event("pml_step_done", rec)
 
-        # Checkpoint snapshot + git
-        self._checkpoint_snapshot(step)
-        self._git_checkpoint(step)
+        self.git.maybe_commit(f"pml: {sid} {title}")
 
-        return ok
+        log(f"[PML] Step done: {sid} in {dt:.2f}s")
 
-    def _checkpoint_snapshot(self, step: PMLStep) -> None:
-        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        snap_dir = PML_CHECKPOINT_DIR / f"{ts}_{step.id}"
-        try:
-            snap_dir.mkdir(parents=True, exist_ok=True)
-            # copy only pml tree snapshot (best-effort)
-            dst = snap_dir / "pml"
-            if dst.exists():
-                shutil.rmtree(dst, ignore_errors=True)
-            shutil.copytree(PML_DIR, dst)
-            LOG.log(f"[SNAP] Saved checkpoint: {snap_dir}")
-        except Exception as e:
-            LOG.log(f"[SNAP] Failed: {e}")
+    def loop(self) -> None:
+        log(
+            f"[PML] Starting loop: agent_calls={self.cfg.agent_calls}, sleep_between={self.cfg.sleep_between}s (Ctrl+C to stop)"
+        )
 
-    def _git_checkpoint(self, step: PMLStep) -> None:
-        msg = f"pml: {step.id} - {step.title}"
-        res = git_autosave(msg)
-        if res.get("ok"):
-            LOG.log("[GIT] autosave commit+push ok")
-        else:
-            LOG.log(f"[GIT] autosave skipped/failed: {res.get('reason') or res.get('error')}")
+        iteration = 0
+        while True:
+            iteration += 1
+            log(f"[PML] === Global iteration {iteration} ===")
 
+            step = self.db.next_pending_step()
+            if not step:
+                log("[PML] No pending steps. Generating more.")
+                self._generate_more_steps("queue empty")
+                step = self.db.next_pending_step()
+                if not step:
+                    log("[PML] Still no steps after generation. Sleeping 10s")
+                    time.sleep(10)
+                    continue
 
-# --------------------------------------------------------------------------------------
-# CLI commands
-# --------------------------------------------------------------------------------------
+            log(f"[PML] Working step={step['id']} phase={step['phase']} title={step['title']}")
+            try:
+                self.run_one_step(step)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                log(f"[EXC] [PML] Step crashed: {e}")
+                self.db.add_event(
+                    "pml_step_crash",
+                    {"step": step, "err": str(e), "ts": now()},
+                )
+                try:
+                    self.db.mark_step(step["id"], "blocked")
+                except Exception:
+                    pass
+                self.git.maybe_commit(f"pml: crash {step['id']}")
 
+            if not self.cfg.loop_till_stopped:
+                break
 
-def cmd_warmup(lm: LMClient) -> None:
-    ensure_pml_layout()
-    PMLDocs().ensure_skeleton()
-    LOG.log("Running warmup call...")
-    messages = [
-        {"role": "system", "content": "You are a probe. Reply with exactly one word."},
-        {"role": "user", "content": "Ready"},
-    ]
-    out = lm.chat(messages, max_tokens=8, temperature=0.0, top_p=1.0, stream=False)
-    LOG.log(f"Warmup output: {out.strip()!r}")
-
-
-def cmd_pml_init() -> None:
-    ensure_pml_layout()
-    docs = PMLDocs()
-    docs.ensure_skeleton()
-    StepStore(PML_STEPS_PATH).ensure_seed()
-    docs.update_workspace_index()
-    LOG.log("[PML] Initialized pml workspace, docs, and seed steps.")
+            if self.cfg.sleep_between > 0:
+                time.sleep(self.cfg.sleep_between)
 
 
-def cmd_status() -> None:
-    ensure_pml_layout()
-    steps = StepStore(PML_STEPS_PATH).ensure_seed()
-    pending = [s for s in steps if s.status != "done"]
-    done = [s for s in steps if s.status == "done"]
-    failed = [s for s in steps if s.status == "failed"]
+def build_global_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--lm-url", default=os.environ.get("LMSTUDIO_URL", AppConfig.lm_url))
+    p.add_argument("--lm-model", default=os.environ.get("LMSTUDIO_MODEL", AppConfig.lm_model))
 
-    LOG.log(f"[STATUS] total={len(steps)} done={len(done)} pending={len(pending)} failed={len(failed)}")
-    if pending:
-        nxt = StepStore(PML_STEPS_PATH).pick_next(steps)
-        if nxt:
-            LOG.log(f"[STATUS] next={nxt.id} phase={nxt.phase} title={nxt.title}")
+    p.add_argument("--ssl-verify", dest="ssl_verify", action="store_true")
+    p.add_argument("--no-ssl-verify", dest="ssl_verify", action="store_false")
+    p.set_defaults(ssl_verify=True)
 
+    p.add_argument("--stream", dest="stream", action="store_true")
+    p.add_argument("--no-stream", dest="stream", action="store_false")
+    p.set_defaults(stream=False)
 
-def cmd_generate_steps(lm: LMClient, memory: MemoryStore, steps_store: StepStore, count: int) -> None:
-    gen = Brainstormer(lm, memory).propose_steps(count=count)
-    if not gen:
-        LOG.log("[PML] Brainstormer produced nothing.")
-        return
-    steps = steps_store.ensure_seed()
-    steps.extend(gen)
-    steps_store.save(steps)
-    LOG.log(f"[PML] Added {len(gen)} steps.")
-
-
-def cmd_pml_step(agent: PMLAgent, agent_calls: int) -> None:
-    agent.run_one_step(agent_calls=agent_calls)
-
-
-def cmd_pml_loop(agent: PMLAgent, *, agent_calls: int, sleep_between: int) -> None:
-    LOG.log(
-        f"[PML] Starting loop: agent_calls={agent_calls}, sleep_between={sleep_between}s (Ctrl+C to stop)"
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=0,
+        help="Request timeout seconds. 0 means no timeout.",
     )
-    it = 0
-    last_health_log = 0.0
 
-    while True:
-        it += 1
-        LOG.log(f"[PML] === Global iteration {it} ===")
-        try:
-            agent.health.check_and_cool_if_overheated()
-            agent.run_one_step(agent_calls=agent_calls)
-        except KeyboardInterrupt:
-            LOG.log("[PML] Stopped by user.")
-            break
-        except Exception as e:
-            LOG.exception(f"[PML] Loop crash: {e}")
-            crashlog(f"loop crash: {e}\n{traceback.format_exc()}")
+    p.add_argument("--ctx-len", type=int, default=int(os.environ.get("LM_CTX_LEN", "4096")))
+    p.add_argument("--max-tokens", type=int, default=int(os.environ.get("LM_MAX_TOKENS", "2048")))
+    p.add_argument("--temperature", type=float, default=float(os.environ.get("LM_TEMPERATURE", "0.2")))
+    p.add_argument("--top-p", type=float, default=float(os.environ.get("LM_TOP_P", "0.9")))
 
-        # periodic non-blocking temp log (only if readable)
-        now = time.time()
-        if now - last_health_log > 120:
-            last_health_log = now
-            gpu_t = agent.health._read_gpu_temp_nvidia_smi()
-            cpu_t = agent.health._read_cpu_temp_best_effort()
-            if gpu_t is not None or cpu_t is not None:
-                LOG.log(f"[HEALTH] temps: gpu={gpu_t if gpu_t is not None else '?'}C cpu={cpu_t if cpu_t is not None else '?'}C")
+    p.add_argument("--agent-calls", type=int, default=int(os.environ.get("AGENT_CALLS", "6")))
+    p.add_argument("--sleep-between", type=int, default=int(os.environ.get("SLEEP_BETWEEN", "0")))
+    p.add_argument("--loop-till-stopped", action="store_true")
 
-        time.sleep(max(0, int(sleep_between)))
+    p.add_argument("--monitor", dest="monitor", action="store_true")
+    p.add_argument("--no-monitor", dest="monitor", action="store_false")
+    p.set_defaults(monitor=True)
 
+    p.add_argument("--max-gpu-temp", type=int, default=int(os.environ.get("MAX_GPU_TEMP", "86")))
+    p.add_argument("--cooldown", type=int, default=int(os.environ.get("COOLDOWN", "600")))
 
-# --------------------------------------------------------------------------------------
-# Argparse
-# --------------------------------------------------------------------------------------
+    p.add_argument("--auto-approve", dest="auto_approve", action="store_true")
+    p.add_argument("--no-auto-approve", dest="auto_approve", action="store_false")
+    p.set_defaults(auto_approve=True)
 
+    p.add_argument("--safe-mode", dest="safe_mode", action="store_true")
+    p.add_argument("--no-safe-mode", dest="safe_mode", action="store_false")
+    p.set_defaults(safe_mode=True)
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Project Me — PML-only autonomous agent")
+    p.add_argument("--git-auto", dest="git_auto", action="store_true")
+    p.add_argument("--no-git-auto", dest="git_auto", action="store_false")
+    p.set_defaults(git_auto=True)
 
-    # Compatibility flags
-    p.add_argument("--pml-create", action="store_true", help="Alias for pml-loop")
-    p.add_argument("--loop-till-stopped", action="store_true", help="Ignored (kept for compatibility)")
+    p.add_argument("--git-push", dest="git_push", action="store_true")
+    p.add_argument("--no-git-push", dest="git_push", action="store_false")
+    p.set_defaults(git_push=True)
 
-    # Common flags
-    p.add_argument("--lm-url", default=DEFAULT_LM_URL)
-    p.add_argument("--lm-model", default=DEFAULT_LM_MODEL)
-    p.add_argument("--ssl-verify", action="store_true", default=DEFAULT_SSL_VERIFY)
-    p.add_argument("--no-ssl-verify", action="store_false", dest="ssl_verify")
+    p.add_argument("--git-interval", type=int, default=int(os.environ.get("GIT_INTERVAL", "300")))
 
-    p.add_argument("--stream", action="store_true", help="Stream tokens (less blank terminal)")
-
-    p.add_argument("--agent-calls", type=int, default=DEFAULT_AGENT_CALLS_PER_STEP)
-    p.add_argument("--sleep-between", type=int, default=DEFAULT_SLEEP_BETWEEN_STEPS)
-
-    p.add_argument("--max-gpu-temp", type=int, default=DEFAULT_MAX_GPU_TEMP_C)
-    p.add_argument("--max-cpu-temp", type=int, default=DEFAULT_MAX_CPU_TEMP_C)
-    p.add_argument("--cooldown", type=int, default=DEFAULT_OVERHEAT_COOLDOWN_SEC)
-
-    sub = p.add_subparsers(dest="cmd")
-
-    sub.add_parser("warmup")
-    sub.add_parser("pml-init")
-    sub.add_parser("status")
-
-    sp = sub.add_parser("pml-step")
-
-    lp = sub.add_parser("pml-loop")
-
-    gp = sub.add_parser("gen-steps")
-    gp.add_argument("--count", type=int, default=12)
+    p.add_argument("--pml-create", action="store_true", help="Compatibility: init PML + start loop")
 
     return p
 
 
+def build_cmd_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="project_me", description="Project Me PML agent")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_w = sub.add_parser("warmup", help="Test LM Studio connectivity")
+    p_w.set_defaults(cmd="warmup")
+
+    p_chat = sub.add_parser("chat", help="One-shot question")
+    p_chat.add_argument("message")
+    p_chat.set_defaults(cmd="chat")
+
+    p_task = sub.add_parser("task", help="Multi-tool task (agent action loop)")
+    p_task.add_argument("prompt")
+    p_task.add_argument("--mode", choices=["auto", "bootstrap", "refactor", "review", "pml"], default="auto")
+    p_task.add_argument("--max-calls", type=int, default=6)
+    p_task.set_defaults(cmd="task")
+
+    p_status = sub.add_parser("status", help="Show steps + last heartbeat")
+    p_status.set_defaults(cmd="status")
+
+    p_init = sub.add_parser("pml-init", help="Initialize pml/ + seed steps")
+    p_init.set_defaults(cmd="pml-init")
+
+    p_step = sub.add_parser("pml-step", help="Run a single step (by id or next pending)")
+    p_step.add_argument("--id", dest="step_id", default="")
+    p_step.set_defaults(cmd="pml-step")
+
+    p_loop = sub.add_parser("pml-loop", help="Loop executing PML steps")
+    p_loop.set_defaults(cmd="pml-loop")
+
+    p_gen = sub.add_parser("gen-steps", help="Ask the model to generate more steps")
+    p_gen.add_argument("--reason", default="manual")
+    p_gen.set_defaults(cmd="gen-steps")
+
+    return parser
+
+
+def merge_namespaces(a: argparse.Namespace, b: argparse.Namespace) -> argparse.Namespace:
+    out = argparse.Namespace()
+    for k, v in vars(a).items():
+        setattr(out, k, v)
+    for k, v in vars(b).items():
+        setattr(out, k, v)
+    return out
+
+
+def load_cfg(global_ns: argparse.Namespace) -> AppConfig:
+    cfg = AppConfig()
+    cfg.lm_url = str(global_ns.lm_url)
+    cfg.lm_model = str(global_ns.lm_model)
+    cfg.stream = bool(global_ns.stream)
+    cfg.ssl_verify = bool(global_ns.ssl_verify)
+
+    cfg.timeout_s = None if float(global_ns.timeout) == 0 else float(global_ns.timeout)
+
+    cfg.ctx_len = int(global_ns.ctx_len)
+    cfg.max_tokens = int(global_ns.max_tokens)
+    cfg.temperature = float(global_ns.temperature)
+    cfg.top_p = float(global_ns.top_p)
+
+    cfg.agent_calls = int(global_ns.agent_calls)
+    cfg.sleep_between = int(global_ns.sleep_between)
+    cfg.loop_till_stopped = bool(global_ns.loop_till_stopped)
+
+    cfg.monitor = bool(global_ns.monitor)
+    cfg.max_gpu_temp_c = int(global_ns.max_gpu_temp)
+    cfg.cooldown_s = int(global_ns.cooldown)
+
+    cfg.auto_approve = bool(global_ns.auto_approve)
+    cfg.safe_mode = bool(global_ns.safe_mode)
+
+    cfg.git_auto = bool(global_ns.git_auto)
+    cfg.git_push = bool(global_ns.git_push)
+    cfg.git_interval_s = int(global_ns.git_interval)
+
+    return cfg
+
+
+def cmd_warmup(agent: Agent) -> None:
+    log("Running warmup call…")
+    answer, _ = agent.run_action_loop(
+        prompt="Just reply with the single word: Ready.",
+        mode="auto",
+        max_calls=1,
+        meta={"kind": "warmup"},
+    )
+    log(f"Warmup output: {answer!r}")
+
+
+def cmd_chat(agent: Agent, message: str) -> None:
+    log("Starting one-shot chat…")
+    answer, _ = agent.run_action_loop(
+        prompt=message,
+        mode="auto",
+        max_calls=1,
+        meta={"kind": "chat"},
+    )
+    print("\n=== MODEL RESPONSE ===\n")
+    print(answer)
+    print("\n======================\n")
+
+
+def cmd_task(agent: Agent, prompt: str, mode: str, max_calls: int) -> None:
+    log(f"Starting task: mode={mode} max_calls={max_calls}")
+    answer, _ = agent.run_action_loop(
+        prompt=prompt,
+        mode=mode,
+        max_calls=max_calls,
+        meta={"kind": "task", "mode": mode},
+    )
+    print("\n=== TASK RESULT ===\n")
+    print(answer)
+    print("\n===================\n")
+
+
+def cmd_status(paths: ProjectPaths, db: ProjectDB) -> None:
+    print("\n--- Steps (latest 30) ---")
+    for s in db.list_steps(limit=30):
+        print(f"{s['id']} [{s['phase']}] {s['status']} - {s['title']}")
+
+    print("\n--- Heartbeat ---")
+    if paths.heartbeat_path.exists():
+        try:
+            hb = json.loads(paths.heartbeat_path.read_text(encoding="utf-8"))
+            gpu = hb.get("gpu")
+            cpu = hb.get("cpu")
+            print("cpu:", cpu)
+            print("gpu:", gpu)
+        except Exception:
+            print(paths.heartbeat_path.read_text(encoding="utf-8")[:1000])
+    else:
+        print("(no heartbeat yet)")
+
+
 def main(argv: Optional[List[str]] = None) -> None:
-    ensure_pml_layout()
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
 
-    # compat dispatch
-    if args.pml_create and not args.cmd:
-        args.cmd = "pml-loop"
+    base_dir = Path(__file__).resolve().parent
+    paths = ProjectPaths(base_dir)
+    paths.ensure()
 
-    if not args.cmd:
-        parser.print_help()
-        sys.exit(1)
+    lock = SingleInstanceLock(paths.lock_path)
+    lock.acquire()
 
-    LOG.log(f"[LM] Using LM Studio at {args.lm_url} model='{args.lm_model}'")
+    def _cleanup(*_: Any) -> None:
+        lock.release()
 
-    lm = LMClient(args.lm_url, args.lm_model, ssl_verify=bool(args.ssl_verify))
+    try:
+        atexit = __import__("atexit")
+        atexit.register(_cleanup)
+    except Exception:
+        pass
 
-    if args.cmd == "warmup":
-        cmd_warmup(lm)
-        return
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, lambda *_: (_cleanup(), sys.exit(0)))
+        except Exception:
+            pass
 
-    if args.cmd == "pml-init":
-        cmd_pml_init()
-        return
+    gp = build_global_parser()
+    global_ns, remainder = gp.parse_known_args(argv)
 
-    if args.cmd == "status":
-        cmd_status()
-        return
+    cp = build_cmd_parser()
+    cmd_ns = cp.parse_args(remainder)
 
-    memory = MemoryStore(PML_MEMORY_PATH)
-    steps = StepStore(PML_STEPS_PATH)
-    docs = PMLDocs()
-    tools = ToolRunner()
-    health = HealthMonitor(
-        max_gpu_temp_c=int(args.max_gpu_temp),
-        max_cpu_temp_c=int(args.max_cpu_temp),
-        cooldown_seconds=int(args.cooldown),
-    )
+    ns = merge_namespaces(global_ns, cmd_ns)
 
-    agent = PMLAgent(
-        lm,
-        memory,
-        steps,
-        docs,
-        tools,
-        health,
-        stream=bool(args.stream),
-    )
+    cfg = load_cfg(global_ns)
 
-    if args.cmd == "gen-steps":
-        cmd_generate_steps(lm, memory, steps, int(args.count))
-        return
+    log(f"[LM] Using LM Studio at {cfg.lm_url} model='{cfg.lm_model}'")
 
-    if args.cmd == "pml-step":
-        cmd_pml_step(agent, int(args.agent_calls))
-        return
+    db = ProjectDB(paths.db_path)
+    ws = Workspace(paths)
+    tools = ToolRunner(cfg, ws)
+    lm = LMStudioClient(cfg)
+    agent = Agent(cfg, lm, db, ws, tools)
 
-    if args.cmd == "pml-loop":
-        cmd_pml_loop(agent, agent_calls=int(args.agent_calls), sleep_between=int(args.sleep_between))
-        return
+    monitor = HealthMonitor(cfg, paths)
+    monitor.start()
 
-    parser.print_help()
+    steps = PMLSteps(paths, db)
+    steps.init_files()
+    git = GitBackup(cfg, tools)
+    runner = PMLRunner(cfg, paths, db, agent, tools, steps, git)
+
+    try:
+        if getattr(ns, "pml_create", False):
+            log("[CLI] --pml-create set; starting pml-loop")
+            cfg.loop_till_stopped = True
+            runner.loop()
+            return
+
+        if ns.cmd == "warmup":
+            cmd_warmup(agent)
+        elif ns.cmd == "chat":
+            cmd_chat(agent, ns.message)
+        elif ns.cmd == "task":
+            cmd_task(agent, ns.prompt, ns.mode, int(ns.max_calls))
+        elif ns.cmd == "status":
+            cmd_status(paths, db)
+        elif ns.cmd == "pml-init":
+            log("[PML] Initialized.")
+        elif ns.cmd == "pml-step":
+            step = None
+            if ns.step_id:
+                step = {"id": ns.step_id, "phase": "pml", "title": ns.step_id, "body": "", "status": "todo"}
+                full = steps._get_step_full(ns.step_id)
+                if full:
+                    step = full
+            else:
+                step = db.next_pending_step()
+            if not step:
+                log("[PML] No pending step.")
+                return
+            runner.run_one_step(step)
+        elif ns.cmd == "pml-loop":
+            runner.loop()
+        elif ns.cmd == "gen-steps":
+            runner._generate_more_steps(ns.reason)
+        else:
+            raise RuntimeError(f"Unknown cmd: {ns}")
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+        try:
+            monitor.stop()
+        except Exception:
+            pass
+        lock.release()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        LOG.log("Stopped.")
-    except Exception as e:
-        LOG.exception(f"Fatal crash: {e}")
-        crashlog(f"fatal: {e}\n{traceback.format_exc()}")
-        raise
+    main()

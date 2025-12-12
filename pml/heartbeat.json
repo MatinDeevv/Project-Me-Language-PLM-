@@ -1,0 +1,22 @@
+{
+  "ts": 1765512272.4943705,
+  "cpu": {
+    "ok": true,
+    "cpu_pct": 35.6,
+    "ram_pct": 97.2,
+    "ram_used_gb": 30.75,
+    "ram_total_gb": 31.63
+  },
+  "gpu": {
+    "ok": true,
+    "temp_c": 64,
+    "mem_used_mb": 3820,
+    "mem_total_mb": 4096,
+    "util_pct": 14
+  },
+  "disk": {
+    "ok": true,
+    "free_gb": 400.77,
+    "total_gb": 951.81
+  }
+}
