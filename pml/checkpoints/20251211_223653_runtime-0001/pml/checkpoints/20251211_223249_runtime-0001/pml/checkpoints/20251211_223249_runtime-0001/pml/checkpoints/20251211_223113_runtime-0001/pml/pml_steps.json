@@ -1,0 +1,26 @@
+{
+  "goal": "Design and evolve PML into a practical DSL that compiles to Python for large, long-lived systems.",
+  "phases": [
+    {
+      "name": "spec_bootstrap",
+      "mode": "pml_design",
+      "prompt": "Refine the core PML spec in pml_spec.md: syntax, core constructs, and guiding principles.",
+      "agent_steps": 3,
+      "max_tokens": 1024
+    },
+    {
+      "name": "compiler_bootstrap",
+      "mode": "pml_compiler",
+      "prompt": "Design or refine the Python-based compiler/runtime that turns PML into Python modules.",
+      "agent_steps": 4,
+      "max_tokens": 2048
+    },
+    {
+      "name": "examples_and_tests",
+      "mode": "pml_examples",
+      "prompt": "Add or refine PML examples and tests that demonstrate realistic systems.",
+      "agent_steps": 3,
+      "max_tokens": 1536
+    }
+  ]
+}
