@@ -1,6 +1,7 @@
 # PML (Project Me Language)
 
-PML is a tiny, practical DSL whose purpose is to **describe large, long-lived software systems** at a higher level than Python, while still compiling into **plain Python**.
+PML is a tiny, practical DSL whose purpose is to describe long-lived software systems at a higher level than Python,
+while compiling into plain Python.
 
 ## Design goals
 - Human-readable enough to review, but structured enough for the agent to transform.
@@ -9,15 +10,14 @@ PML is a tiny, practical DSL whose purpose is to **describe large, long-lived so
 - Keeps files minimal (prefer a few well-named modules over file explosions).
 
 ## Core concepts
-- **Unit**: a module or component.
-- **Contract**: interface + invariants.
-- **Pipeline**: ordered execution phases.
-- **Step**: atomic iteration task the agent executes.
+- Unit: module or component.
+- Contract: interface + invariants.
+- Pipeline: ordered execution phases.
+- Step: atomic iteration task the agent executes.
 
 ## Step JSON format
-`pml/steps.json` is the agent’s work queue.
-Each item is:
-```json
+pml/steps.json is the agent’s work queue.
+Each item:
 {
   "id": "runtime-0001",
   "phase": "runtime",
@@ -25,77 +25,11 @@ Each item is:
   "body": "What to build/change and acceptance criteria",
   "status": "todo"
 }
-```
 
 ## Runtime principle
 The agent should:
 1. Read current workspace.
 2. Execute exactly one step.
 3. Save progress immediately.
-4. Auto-generate new steps when queue is empty.
+4. Avoid infinite loops unless explicitly enabled.
 
-# PML (Project Me Language)
-
-PML is a tiny, practical DSL whose purpose is to **describe large, long-lived software systems** at a higher level than Python, while still compiling into **plain Python**.
-
-## Design goals
-- Human-readable enough to review, but structured enough for the agent to transform.
-- Compiles into Python packages with tests.
-- Encourages explicit modules, interfaces, and contracts.
-- Keeps files minimal (prefer a few well-named modules over file explosions).
-
-## Core concepts
-- **Unit**: a module or component.
-- **Contract**: interface + invariants.
-- **Pipeline**: ordered execution phases.
-- **Step**: atomic iteration task the agent executes.
-
-## Step JSON format
-`pml/steps.json` is the agent’s work queue.
-Each item is:
-```json
-{
-  "id": "runtime-0001",
-  "phase": "runtime",
-  "title": "Scaffold runtime",
-  "body": "What to build/change and acceptance criteria",
-  "status": "todo"
-}
-```
-
-## Runtime principle
-The agent should:
-1. Read current workspace.
-2. Execute exactly one step.
-3. Save progress immediately.
-4. Auto-generate new steps when queue is empty.
-
-## Syntax Sketch
-
-### Modules
-```pml
-module my_module {
-  // module contents
-}
-```
-
-### Contracts
-```pml
-contract my_contract {
-  interface {
-    // function signatures
-  }
-  invariants {
-    // pre/post conditions
-  }
-}
-```
-
-### Pipelines
-```pml
-pipeline my_pipeline {
-  step1: module_a.do_something()
-  step2: module_b.process(step1)
-  step3: module_c.validate(step2)
-}
-```

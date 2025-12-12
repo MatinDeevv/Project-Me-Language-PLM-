@@ -7,11 +7,53 @@
     "status": "done"
   },
   {
+    "id": "compiler-0003",
+    "phase": "compiler",
+    "title": "Implement the PML compiler to generate Python code from PML ASTs",
+    "body": "",
+    "status": "todo"
+  },
+  {
+    "id": "compiler-0004",
+    "phase": "compiler",
+    "title": "Optimize the PML compiler to generate more efficient Python code",
+    "body": "",
+    "status": "todo"
+  },
+  {
+    "id": "docs-0003",
+    "phase": "docs",
+    "title": "Update project documentation with new PML features",
+    "body": "",
+    "status": "todo"
+  },
+  {
+    "id": "docs-0004",
+    "phase": "docs",
+    "title": "Update project documentation with error handling features",
+    "body": "",
+    "status": "todo"
+  },
+  {
     "id": "runtime-0001",
     "phase": "runtime",
     "title": "Bootstrap PML runtime inside this repo",
-    "body": "Ensure pml/ exists, pml.db exists, and the CLI can run pml-loop safely for days. Keep files minimal.",
+    "body": "Ensure pml/ exists, pml.db exists, and the CLI can run pml-loop safely. Keep files minimal.",
     "status": "done"
+  },
+  {
+    "id": "runtime-0003",
+    "phase": "runtime",
+    "title": "Implement runtime environment for Python emitted code",
+    "body": "",
+    "status": "blocked"
+  },
+  {
+    "id": "runtime-0004",
+    "phase": "runtime",
+    "title": "Implement error handling for the runtime environment",
+    "body": "",
+    "status": "todo"
   },
   {
     "id": "spec-0001",
@@ -19,5 +61,19 @@
     "title": "Define PML syntax sketch",
     "body": "Write a compact syntax sketch: modules, contracts, pipelines. Store in pml/PML.md (append).",
     "status": "done"
+  },
+  {
+    "id": "tests-0001",
+    "phase": "tests",
+    "title": "Write unit tests for the new runtime environment and compiler",
+    "body": "",
+    "status": "todo"
+  },
+  {
+    "id": "tests-0002",
+    "phase": "tests",
+    "title": "Expand unit tests for error handling in the new runtime environment and compiler",
+    "body": "",
+    "status": "todo"
   }
 ]

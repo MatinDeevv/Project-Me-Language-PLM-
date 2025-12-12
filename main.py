@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import json
 import os
 import re
@@ -15,79 +14,100 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
 
 import requests
 
+# --- Optional dependency (psutil) ---
+def try_import_psutil():
+    try:
+        import psutil  # type: ignore
+        return psutil
+    except Exception:
+        return None
+
 ActionType = Literal["tool", "final"]
 
-
+# ---------------------- utils ----------------------
 def _ts() -> str:
     return time.strftime("%H:%M:%S")
 
+def now() -> float:
+    return time.time()
 
 def log(msg: str) -> None:
     tid = threading.get_ident()
     print(f"[{_ts()}][T{tid}] {msg}", flush=True)
 
-
 def jdump(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
-
 
 def clamp_int(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
 
-
-def now() -> float:
-    return time.time()
-
-
-def try_import_psutil():
+def _safe_int(x: Any, default: int = 0) -> int:
     try:
-        import psutil  # type: ignore
-
-        return psutil
+        return int(x)
     except Exception:
-        return None
+        return default
 
-
+# ---------------------- config ----------------------
 @dataclass
 class AppConfig:
+    # LM Studio
     lm_url: str = "http://127.0.0.1:1234/v1/chat/completions"
-    lm_model: str = "qwen/qwen3-coder-30b"
+    lm_model: str = "deepseek-coder-6.7b-instruct"
     stream: bool = False
     ssl_verify: bool = True
-
     timeout_s: Optional[float] = None
 
-    ctx_len: int = 4096
-    max_tokens: int = 2048
-    temperature: float = 0.2
+    # LLM sampling / budget (safe defaults for 4GB VRAM)
+    ctx_len: int = 2048
+    max_tokens: int = 512
+    temperature: float = 0.1
     top_p: float = 0.9
 
+    # Agent / loop
     agent_calls: int = 6
-    sleep_between: int = 0
+    sleep_between: int = 5
     loop_till_stopped: bool = False
+    max_iterations: int = 0  # 0 = unlimited
 
+    # Health monitoring (guardrails)
     monitor: bool = True
     monitor_interval_s: int = 10
     max_gpu_temp_c: int = 86
     max_cpu_temp_c: int = 95
     cooldown_s: int = 600
 
+    max_vram_pct: int = 98
+    max_ram_pct: int = 92
+    hard_exit_on_crit: bool = False
+    bypass_health: bool = False
+
+    # Safety (tools)
     auto_approve: bool = True
     safe_mode: bool = True
 
+    # Git
     git_auto: bool = True
     git_push: bool = True
     git_interval_s: int = 300
 
+    # RAG / workspace
     rag_k: int = 3
     max_rag_chars: int = 2500
     max_workspace_chars: int = 2500
 
+    # Autonomy
+    auto_generate_steps: bool = False
+    gen_steps_count: int = 8
 
+    # LM throttling (prevents driver death)
+    max_inflight_lm: int = 1
+    min_lm_interval_s: float = 2.0
+
+# ---------------------- paths ----------------------
 class ProjectPaths:
     def __init__(self, base_dir: Path):
         self.base_dir = base_dir
@@ -102,21 +122,69 @@ class ProjectPaths:
     def ensure(self) -> None:
         self.pml_dir.mkdir(parents=True, exist_ok=True)
 
+# ---------------------- lock ----------------------
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    psutil = try_import_psutil()
+    if psutil:
+        try:
+            return bool(psutil.pid_exists(pid))
+        except Exception:
+            pass
+
+    # Fallbacks without psutil
+    if os.name == "nt":
+        try:
+            p = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            out = (p.stdout or "").strip()
+            # tasklist prints header + row if found
+            return str(pid) in out
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except Exception:
+            return False
 
 class SingleInstanceLock:
-    def __init__(self, lock_path: Path):
+    def __init__(self, lock_path: Path, *, force: bool = False):
         self.lock_path = lock_path
+        self.force = force
 
     def acquire(self) -> None:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+
         if self.lock_path.exists():
+            data: Dict[str, Any] = {}
             try:
                 data = json.loads(self.lock_path.read_text(encoding="utf-8"))
             except Exception:
                 data = {}
-            raise RuntimeError(
-                f"Lock exists at {self.lock_path}. Another run might be active. lock={data}"
-            )
+
+            pid = _safe_int(data.get("pid"), 0)
+            if pid and _pid_is_running(pid):
+                if not self.force:
+                    raise RuntimeError(
+                        f"Lock exists at {self.lock_path}. Another run might be active. lock={data}. "
+                        f"Use --force-lock to override."
+                    )
+                log(f"[LOCK] Forcing lock takeover (pid {pid} seems running).")
+            else:
+                log(f"[LOCK] Stale lock detected (pid {pid} not running). Clearing lock.")
+
+            try:
+                self.lock_path.unlink()
+            except Exception:
+                pass
+
         self.lock_path.write_text(jdump({"pid": os.getpid(), "ts": now()}), encoding="utf-8")
 
     def release(self) -> None:
@@ -125,7 +193,7 @@ class SingleInstanceLock:
         except Exception:
             pass
 
-
+# ---------------------- health monitor ----------------------
 class HealthMonitor:
     def __init__(self, cfg: AppConfig, paths: ProjectPaths):
         self.cfg = cfg
@@ -158,12 +226,14 @@ class HealthMonitor:
             mem_used = int(parts[1])
             mem_total = int(parts[2])
             util = int(parts[3])
+            vram_pct = int(round((mem_used / max(1, mem_total)) * 100))
             return {
                 "ok": True,
                 "temp_c": temp,
                 "mem_used_mb": mem_used,
                 "mem_total_mb": mem_total,
                 "util_pct": util,
+                "vram_pct": vram_pct,
             }
         except Exception:
             return {"ok": False, "err": "nvidia-smi unavailable"}
@@ -195,6 +265,52 @@ class HealthMonitor:
         except Exception as e:
             return {"ok": False, "err": str(e)}
 
+    def _maybe_protect(self, stats: Dict[str, Any]) -> None:
+        if self.cfg.bypass_health:
+            return
+
+        # VRAM guard
+        gpu = stats.get("gpu") or {}
+        if gpu.get("ok"):
+            vram_pct = gpu.get("vram_pct")
+            if isinstance(vram_pct, int) and vram_pct >= self.cfg.max_vram_pct:
+                log(f"[HEALTH] VRAM critical ({vram_pct}% >= {self.cfg.max_vram_pct}%).")
+                if self.cfg.hard_exit_on_crit:
+                    log("[HEALTH] Hard-exit to prevent GPU driver reset.")
+                    os._exit(1)
+                # otherwise just cool down
+                log(f"[HEALTH] Cooling down {self.cfg.cooldown_s}s (soft).")
+                slept = 0
+                while slept < self.cfg.cooldown_s and not self._stop.is_set():
+                    time.sleep(1)
+                    slept += 1
+                return
+
+        # Temp guard
+        temp = gpu.get("temp_c") if gpu.get("ok") else None
+        if isinstance(temp, int) and temp >= self.cfg.max_gpu_temp_c:
+            log(f"[HEALTH] GPU temp high ({temp}°C >= {self.cfg.max_gpu_temp_c}°C). Cooling {self.cfg.cooldown_s}s")
+            slept = 0
+            while slept < self.cfg.cooldown_s and not self._stop.is_set():
+                time.sleep(1)
+                slept += 1
+            return
+
+        # RAM guard
+        cpu = stats.get("cpu") or {}
+        ram_pct = cpu.get("ram_pct") if cpu.get("ok") else None
+        if isinstance(ram_pct, (int, float)) and float(ram_pct) >= float(self.cfg.max_ram_pct):
+            log(f"[HEALTH] RAM critical ({ram_pct}% >= {self.cfg.max_ram_pct}%).")
+            if self.cfg.hard_exit_on_crit:
+                log("[HEALTH] Hard-exit to prevent OS instability.")
+                os._exit(1)
+            log(f"[HEALTH] Cooling down {self.cfg.cooldown_s}s (soft).")
+            slept = 0
+            while slept < self.cfg.cooldown_s and not self._stop.is_set():
+                time.sleep(1)
+                slept += 1
+            return
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             stats = {
@@ -209,32 +325,45 @@ class HealthMonitor:
             except Exception:
                 pass
 
-            gpu = stats.get("gpu") or {}
-            temp = gpu.get("temp_c") if gpu.get("ok") else None
-
-            if isinstance(temp, int) and temp >= self.cfg.max_gpu_temp_c:
-                log(
-                    f"[HEALTH] GPU temp high ({temp}°C >= {self.cfg.max_gpu_temp_c}°C). Cooling {self.cfg.cooldown_s}s"
-                )
-                slept = 0
-                while slept < self.cfg.cooldown_s and not self._stop.is_set():
-                    time.sleep(1)
-                    slept += 1
-                continue
+            try:
+                self._maybe_protect(stats)
+            except SystemExit:
+                raise
+            except Exception:
+                pass
 
             time.sleep(self.cfg.monitor_interval_s)
 
+# ---------------------- LM client (with throttle) ----------------------
+class _RateLimiter:
+    def __init__(self, min_interval_s: float):
+        self.min_interval_s = float(min_interval_s)
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def wait(self) -> None:
+        if self.min_interval_s <= 0:
+            return
+        with self._lock:
+            dt = now() - self._last
+            if dt < self.min_interval_s:
+                time.sleep(self.min_interval_s - dt)
+            self._last = now()
 
 class LMStudioClient:
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
+        self._sem = threading.Semaphore(max(1, int(cfg.max_inflight_lm)))
+        self._rl = _RateLimiter(cfg.min_lm_interval_s)
 
     def _request(self, payload: Dict[str, Any]) -> requests.Response:
         t0 = now()
         log(
-            f"[LM] POST -> {self.cfg.lm_url} | max_tokens={payload.get('max_tokens')}, temp={payload.get('temperature')}, top_p={payload.get('top_p')}, stream={payload.get('stream')}"
+            f"[LM] POST -> {self.cfg.lm_url} | model={self.cfg.lm_model} "
+            f"max_tokens={payload.get('max_tokens')} temp={payload.get('temperature')} "
+            f"top_p={payload.get('top_p')} stream={payload.get('stream')}"
         )
         resp = self.session.post(
             self.cfg.lm_url,
@@ -265,13 +394,16 @@ class LMStudioClient:
             "stream": bool(stream),
         }
 
-        resp = self._request(payload)
+        with self._sem:
+            self._rl.wait()
+            resp = self._request(payload)
 
         if resp.status_code >= 400:
+            body = ""
             try:
                 body = resp.text[:4000]
             except Exception:
-                body = ""
+                pass
             raise requests.HTTPError(
                 f"{resp.status_code} {resp.reason} from LM Studio. Body (truncated): {body}",
                 response=resp,
@@ -281,7 +413,7 @@ class LMStudioClient:
             data = resp.json()
             return data["choices"][0]["message"]["content"]
 
-        out = []
+        out: List[str] = []
         for line in resp.iter_lines(decode_unicode=True):
             if not line:
                 continue
@@ -301,7 +433,7 @@ class LMStudioClient:
                 sys.stdout.flush()
         return "".join(out)
 
-
+# ---------------------- token budget ----------------------
 class TokenBudgeter:
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
@@ -373,7 +505,7 @@ class TokenBudgeter:
 
         return ms
 
-
+# ---------------------- db ----------------------
 class ProjectDB:
     def __init__(self, db_path: Path):
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -463,7 +595,6 @@ class ProjectDB:
         q = (query or "").strip()
         if not q:
             return []
-
         with self._lock:
             try:
                 cur = self.conn.execute(
@@ -566,7 +697,7 @@ class ProjectDB:
             )
             self.conn.commit()
 
-
+# ---------------------- workspace / tools ----------------------
 class Workspace:
     def __init__(self, paths: ProjectPaths):
         self.paths = paths
@@ -605,7 +736,6 @@ class Workspace:
                 break
             out.append(line)
         return "\n".join(out)
-
 
 class ToolRunner:
     def __init__(self, cfg: AppConfig, ws: Workspace):
@@ -685,17 +815,8 @@ class ToolRunner:
             raise ValueError("Empty cmd")
 
         allowed_prefixes = (
-            "python",
-            "py",
-            "pytest",
-            "pip",
-            "uv",
-            "dir",
-            "ls",
-            "type",
-            "cat",
-            "echo",
-            "git",
+            "python", "py", "pytest", "pip", "uv",
+            "dir", "ls", "type", "cat", "echo", "git",
         )
         first = cmd_strip.split()[0].lower()
         if not any(first.startswith(p) for p in allowed_prefixes):
@@ -722,13 +843,21 @@ class ToolRunner:
     def git_commit_push(self, message: str) -> Dict[str, Any]:
         if not self.cfg.git_auto:
             return {"ok": False, "error": "git_auto disabled"}
+
         msg = (message or "auto").strip()[:120]
+        out: Dict[str, Any] = {}
+
         r1 = self.run_shell("git add -A", timeout=120)
-        r2 = self.run_shell(f"git commit -m \"{msg}\"", timeout=120)
-        out = {"add": r1, "commit": r2}
+        out["add"] = r1
+
+        # commit can fail with "nothing to commit" -> tolerate
+        r2 = self.run_shell(f'git commit -m "{msg}"', timeout=120)
+        out["commit"] = r2
+
         if self.cfg.git_push:
             r3 = self.run_shell("git push", timeout=300)
             out["push"] = r3
+
         return out
 
     def tools_schema(self) -> str:
@@ -755,30 +884,64 @@ class ToolRunner:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+# ---------------------- JSON extraction ----------------------
+JsonValue = Union[Dict[str, Any], List[Any]]
 
-def extract_first_json_obj(text: str) -> Optional[Dict[str, Any]]:
+def extract_first_json_value(text: str) -> Optional[JsonValue]:
+    """
+    Extract the first JSON object or array from a messy model reply.
+    Handles extra text before/after and common ```json fences.
+    """
     if not text:
         return None
-    start = text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    for i in range(start, len(text)):
-        ch = text[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                snippet = text[start : i + 1]
-                try:
-                    obj = json.loads(snippet)
-                    if isinstance(obj, dict):
-                        return obj
-                except Exception:
-                    return None
-    return None
 
+    # strip code fences if present
+    t = text.strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s*```$", "", t)
+
+    first_obj = t.find("{")
+    first_arr = t.find("[")
+    if first_obj < 0 and first_arr < 0:
+        return None
+
+    if first_obj >= 0 and (first_arr < 0 or first_obj < first_arr):
+        start = first_obj
+        open_ch, close_ch = "{", "}"
+    else:
+        start = first_arr
+        open_ch, close_ch = "[", "]"
+
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(t)):
+        ch = t[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        else:
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == open_ch:
+                depth += 1
+            elif ch == close_ch:
+                depth -= 1
+                if depth == 0:
+                    snippet = t[start : i + 1]
+                    try:
+                        val = json.loads(snippet)
+                        if isinstance(val, (dict, list)):
+                            return val
+                    except Exception:
+                        return None
+    return None
 
 def normalize_action(obj: Dict[str, Any]) -> Dict[str, Any]:
     if "action" in obj:
@@ -789,16 +952,9 @@ def normalize_action(obj: Dict[str, Any]) -> Dict[str, Any]:
         return schema
     return obj
 
-
+# ---------------------- Agent ----------------------
 class Agent:
-    def __init__(
-        self,
-        cfg: AppConfig,
-        lm: LMStudioClient,
-        db: ProjectDB,
-        ws: Workspace,
-        tools: ToolRunner,
-    ):
+    def __init__(self, cfg: AppConfig, lm: LMStudioClient, db: ProjectDB, ws: Workspace, tools: ToolRunner):
         self.cfg = cfg
         self.lm = lm
         self.db = db
@@ -811,7 +967,7 @@ class Agent:
             "bootstrap": "Bias: bootstrap multi-file Python projects with clean structure + tests.",
             "refactor": "Bias: minimal-diff refactors; change the least, improve the most.",
             "review": "Bias: review only; do not edit files unless asked.",
-            "pml": "Bias: evolve PML (a DSL that compiles to Python) and its runtime, but keep file-count small.",
+            "pml": "Bias: evolve PML (a DSL that compiles to Python) and its runtime.",
             "auto": "Bias: choose bootstrap/refactor/review dynamically.",
         }.get(mode, "Bias: auto.")
 
@@ -822,11 +978,13 @@ class Agent:
             "- ALWAYS use tools to inspect workspace before writing/renaming/deleting.\n"
             "- Keep diffs minimal when editing existing code.\n"
             "- Prefer few files. Avoid file explosions.\n"
-            "- Output EXACTLY ONE JSON object per message. No markdown, no extra text.\n\n"
+            "- When asked to generate steps, output a JSON ARRAY of step objects (not an action object).\n"
+            "- Otherwise output EXACTLY ONE JSON OBJECT matching the action schema.\n"
+            "- No markdown, no extra commentary.\n\n"
             + self.tools.tools_schema()
             + "\nAction schema (choose ONE):\n"
             + '{"action":"tool","tool_name":"list_dir","tool_args":{},"reasoning":"short"}\n'
-            + '{"action":"final","answer":"markdown answer","reasoning":"short"}\n'
+            + '{"action":"final","answer":"plain text answer","reasoning":"short"}\n'
         )
 
     def _rag_context(self, prompt: str) -> str:
@@ -856,7 +1014,6 @@ class Agent:
             max_workspace_chars=self.cfg.max_workspace_chars,
             max_rag_chars=self.cfg.max_rag_chars,
         )
-
         try:
             return self.lm.chat(
                 fitted,
@@ -868,7 +1025,7 @@ class Agent:
         except requests.HTTPError as e:
             msg = str(e)
             if "context" in msg.lower() or "overflow" in msg.lower() or "n_ctx" in msg.lower():
-                log("[AGENT] Context overflow detected; retrying with aggressive trimming")
+                log("[AGENT] Context overflow; retrying with aggressive trimming")
                 smaller = []
                 for m in fitted:
                     if m.get("role") == "system" and (
@@ -921,13 +1078,19 @@ class Agent:
             last_raw = raw
             log(f"[AGENT] Raw reply length={len(raw)} chars")
 
-            obj = extract_first_json_obj(raw)
-            if not obj:
+            val = extract_first_json_value(raw)
+            if val is None:
                 answer = raw.strip()
                 self.db.add_memory(prompt, answer, {**meta, "tool_calls": tool_calls, "mode": mode})
                 return answer, tool_calls
 
-            obj = normalize_action(obj)
+            # If model returned a JSON ARRAY (step generation), treat as final answer
+            if isinstance(val, list):
+                answer = json.dumps(val, ensure_ascii=False, indent=2)
+                self.db.add_memory(prompt, answer, {**meta, "tool_calls": tool_calls, "mode": mode, "json_array": True})
+                return answer, tool_calls
+
+            obj = normalize_action(val)
             action = str(obj.get("action", "final")).lower()
 
             if action == "final":
@@ -960,15 +1123,16 @@ class Agent:
                 )
                 continue
 
+            # unknown action: return raw
             answer = raw.strip()
-            self.db.add_memory(prompt, answer, {**meta, "tool_calls": tool_calls, "mode": mode})
+            self.db.add_memory(prompt, answer, {**meta, "tool_calls": tool_calls, "mode": mode, "unknown_action": action})
             return answer, tool_calls
 
         answer = last_raw.strip()
         self.db.add_memory(prompt, answer, {**meta, "tool_calls": tool_calls, "mode": mode, "max_calls": max_calls})
         return answer, tool_calls
 
-
+# ---------------------- PML docs / steps ----------------------
 PML_DOCS = """# PML (Project Me Language)
 
 PML is a tiny, practical DSL whose purpose is to **describe large, long-lived software systems** at a higher level than Python, while still compiling into **plain Python**.
@@ -1003,10 +1167,9 @@ The agent should:
 1. Read current workspace.
 2. Execute exactly one step.
 3. Save progress immediately.
-4. Auto-generate new steps when queue is empty.
+4. Auto-generate new steps when queue is empty (optional).
 
 """
-
 
 def default_seed_steps() -> List[Dict[str, Any]]:
     return [
@@ -1014,7 +1177,7 @@ def default_seed_steps() -> List[Dict[str, Any]]:
             "id": "runtime-0001",
             "phase": "runtime",
             "title": "Bootstrap PML runtime inside this repo",
-            "body": "Ensure pml/ exists, pml.db exists, and the CLI can run pml-loop safely for days. Keep files minimal.",
+            "body": "Create minimal pml runtime scaffolding (pml/__init__.py, pml/runtime.py) and ensure CLI can run pml-loop safely. Keep files minimal.",
             "status": "todo",
         },
         {
@@ -1028,11 +1191,10 @@ def default_seed_steps() -> List[Dict[str, Any]]:
             "id": "compiler-0001",
             "phase": "compiler",
             "title": "Compiler plan",
-            "body": "Design compilation pipeline to Python: parse -> IR -> emit. Keep it minimal. Define acceptance tests.",
+            "body": "Design compilation pipeline to Python: parse -> IR -> emit. Create pml/compiler.py stub and a tiny unit test. Keep it minimal.",
             "status": "todo",
         },
     ]
-
 
 class PMLSteps:
     def __init__(self, paths: ProjectPaths, db: ProjectDB):
@@ -1091,7 +1253,7 @@ class PMLSteps:
             return None
         return {"id": r[0], "phase": r[1], "title": r[2], "body": r[3], "status": r[4]}
 
-
+# ---------------------- Git backup ----------------------
 class GitBackup:
     def __init__(self, cfg: AppConfig, tools: ToolRunner):
         self.cfg = cfg
@@ -1107,22 +1269,16 @@ class GitBackup:
         try:
             log(f"[GIT] Auto backup: {message}")
             res = self.tools.git_commit_push(message=message)
-            log(f"[GIT] Backup result: ok={res.get('add',{}).get('returncode',0)==0}")
+            ok_add = (res.get("add", {}) or {}).get("returncode", 1) == 0
+            log(f"[GIT] Backup result: ok_add={ok_add}")
         except Exception as e:
             log(f"[GIT] Backup failed: {e}")
 
+# ---------------------- PML Runner ----------------------
+_MUTATING_TOOLS = {"write_file", "mkdir", "move_path", "delete_path", "git_commit_push"}
 
 class PMLRunner:
-    def __init__(
-        self,
-        cfg: AppConfig,
-        paths: ProjectPaths,
-        db: ProjectDB,
-        agent: Agent,
-        tools: ToolRunner,
-        steps: PMLSteps,
-        git: GitBackup,
-    ):
+    def __init__(self, cfg: AppConfig, paths: ProjectPaths, db: ProjectDB, agent: Agent, tools: ToolRunner, steps: PMLSteps, git: GitBackup):
         self.cfg = cfg
         self.paths = paths
         self.db = db
@@ -1139,44 +1295,76 @@ class PMLRunner:
         except Exception:
             pass
 
-    def _generate_more_steps(self, reason: str) -> None:
-        prompt = (
-            "Generate 8 new PML steps to progress the language and runtime. "
-            "Keep file-count small. Each step must be atomic and executable. "
-            "Return action=final where answer is a JSON array of step objects with keys: id, phase, title, body, status='todo'. "
-            f"Reason: {reason}"
-        )
-        answer, _ = self.agent.run_action_loop(
-            prompt=prompt,
-            mode="pml",
-            max_calls=2,
-            meta={"kind": "gen_steps", "reason": reason},
-        )
-        arr = None
+    def _parse_steps_array(self, answer: str) -> Optional[List[Dict[str, Any]]]:
+        val = extract_first_json_value(answer)
+        if isinstance(val, list):
+            out = []
+            for it in val:
+                if isinstance(it, dict):
+                    out.append(it)
+            return out
+        # last resort
         try:
-            arr = json.loads(answer)
+            raw = json.loads(answer)
+            if isinstance(raw, list):
+                return [x for x in raw if isinstance(x, dict)]
         except Exception:
-            arr = None
-        if not isinstance(arr, list):
-            log("[PML] Step generator did not return a JSON array; skipping")
-            return
-        added = 0
-        for it in arr:
-            if not isinstance(it, dict):
-                continue
-            sid = str(it.get("id") or "").strip()
-            phase = str(it.get("phase") or "pml").strip()
-            title = str(it.get("title") or sid).strip()
-            body = str(it.get("body") or "").strip()
-            status = str(it.get("status") or "todo").strip()
-            if not sid or status != "todo":
-                continue
-            if len(sid) > 64:
-                continue
-            self.db.upsert_step(sid, phase, title, body, "todo")
-            added += 1
-        log(f"[PML] Added {added} new steps")
-        self.steps.export_steps_json()
+            return None
+        return None
+
+    def _generate_more_steps(self, reason: str) -> None:
+        # DeepSeek sometimes resists formatting; we retry with more coercion.
+        prompt = (
+            "Generate NEW PML steps to progress the language and runtime.\n"
+            "Return ONLY a JSON ARRAY. No markdown. No commentary.\n"
+            "Each item MUST be an object with keys:\n"
+            "  id (short unique), phase, title, body, status\n"
+            "Set status to 'todo' for every item.\n"
+            f"Count: {self.cfg.gen_steps_count}\n"
+            f"Reason: {reason}\n"
+            "IDs should be like: runtime-0002, compiler-0002, tests-0001, docs-0002.\n"
+        )
+
+        attempts = 3
+        last_answer = ""
+        for a in range(1, attempts + 1):
+            answer, _ = self.agent.run_action_loop(
+                prompt=prompt + ("" if a == 1 else f"\nRETRY {a}: OUTPUT JSON ARRAY ONLY."),
+                mode="pml",
+                max_calls=2,
+                meta={"kind": "gen_steps", "reason": reason, "attempt": a},
+            )
+            last_answer = answer
+            arr = self._parse_steps_array(answer)
+            if arr:
+                added = 0
+                for it in arr:
+                    sid = str(it.get("id") or "").strip()
+                    phase = str(it.get("phase") or "pml").strip()
+                    title = str(it.get("title") or sid).strip()
+                    body = str(it.get("body") or "").strip()
+                    status = str(it.get("status") or "todo").strip()
+                    if not sid or status != "todo":
+                        continue
+                    if len(sid) > 64:
+                        continue
+                    self.db.upsert_step(sid, phase, title, body, "todo")
+                    added += 1
+                log(f"[PML] Added {added} new steps")
+                self.steps.export_steps_json()
+                return
+
+        log("[PML] Step generator did not return a JSON array; skipping")
+        self.db.add_event("gen_steps_failed", {"ts": now(), "reason": reason, "answer": (last_answer or "")[:2000]})
+
+    def _tool_calls_have_mutation(self, tool_calls: List[Dict[str, Any]]) -> bool:
+        for c in tool_calls:
+            t = str(c.get("tool") or "")
+            if t in _MUTATING_TOOLS:
+                res = c.get("result") or {}
+                if isinstance(res, dict) and res.get("ok") is True:
+                    return True
+        return False
 
     def run_one_step(self, step: Dict[str, Any]) -> None:
         sid = step["id"]
@@ -1187,24 +1375,45 @@ class PMLRunner:
         self.db.mark_step(sid, "doing")
         self.steps.export_steps_json()
 
-        prompt = (
+        base_prompt = (
             "Execute this PML step now.\n"
             f"id: {sid}\nphase: {phase}\ntitle: {title}\n\n"
             "Constraints:\n"
             "- Keep file count small. Prefer updating existing files.\n"
-            "- Use tools for filesystem operations.\n"
+            "- You MUST use tools for filesystem operations.\n"
+            "- You MUST call write_file/mkdir at least once to be considered complete.\n"
             "- At the end, return action=final with: (1) what changed, (2) what to do next, (3) any files edited.\n\n"
             f"Step body:\n{body}\n"
         )
 
         t0 = now()
         answer, tool_calls = self.agent.run_action_loop(
-            prompt=prompt,
+            prompt=base_prompt,
             mode="pml",
-            max_calls=self.cfg.agent_calls,
+            max_calls=max(1, int(self.cfg.agent_calls)),
             meta={"kind": "pml_step", "step_id": sid, "phase": phase, "title": title},
         )
         dt = now() - t0
+
+        if not self._tool_calls_have_mutation(tool_calls):
+            # No edits happened -> do not mark as done.
+            log(f"[PML] Step produced no file edits. Marking blocked: {sid}")
+            self.db.mark_step(sid, "blocked")
+            self.steps.export_steps_json()
+            rec = {
+                "ts": now(),
+                "step_id": sid,
+                "phase": phase,
+                "title": title,
+                "seconds": round(dt, 3),
+                "tool_calls": tool_calls,
+                "answer_preview": (answer or "")[:800],
+                "note": "blocked: no mutating tool calls",
+            }
+            self._append_runlog(rec)
+            self.db.add_event("pml_step_blocked_no_edits", rec)
+            self.git.maybe_commit(f"pml: blocked {sid}")
+            return
 
         self.db.mark_step(sid, "done")
         self.steps.export_steps_json()
@@ -1216,7 +1425,7 @@ class PMLRunner:
             "title": title,
             "seconds": round(dt, 3),
             "tool_calls": tool_calls,
-            "answer_preview": answer[:800],
+            "answer_preview": (answer or "")[:800],
         }
         self._append_runlog(rec)
         self.db.add_event("pml_step_done", rec)
@@ -1226,24 +1435,25 @@ class PMLRunner:
         log(f"[PML] Step done: {sid} in {dt:.2f}s")
 
     def loop(self) -> None:
-        log(
-            f"[PML] Starting loop: agent_calls={self.cfg.agent_calls}, sleep_between={self.cfg.sleep_between}s (Ctrl+C to stop)"
-        )
-
+        log(f"[PML] Starting loop: agent_calls={self.cfg.agent_calls}, sleep_between={self.cfg.sleep_between}s")
         iteration = 0
         while True:
             iteration += 1
+            if self.cfg.max_iterations and iteration > self.cfg.max_iterations:
+                log(f"[PML] Max iterations reached ({self.cfg.max_iterations}). Exiting.")
+                break
+
             log(f"[PML] === Global iteration {iteration} ===")
 
             step = self.db.next_pending_step()
             if not step:
-                log("[PML] No pending steps. Generating more.")
-                self._generate_more_steps("queue empty")
-                step = self.db.next_pending_step()
+                log("[PML] No pending steps.")
+                if self.cfg.auto_generate_steps:
+                    self._generate_more_steps("queue empty")
+                    step = self.db.next_pending_step()
                 if not step:
-                    log("[PML] Still no steps after generation. Sleeping 10s")
-                    time.sleep(10)
-                    continue
+                    log("[PML] Still no steps. Exiting.")
+                    break
 
             log(f"[PML] Working step={step['id']} phase={step['phase']} title={step['title']}")
             try:
@@ -1252,10 +1462,7 @@ class PMLRunner:
                 raise
             except Exception as e:
                 log(f"[EXC] [PML] Step crashed: {e}")
-                self.db.add_event(
-                    "pml_step_crash",
-                    {"step": step, "err": str(e), "ts": now()},
-                )
+                self.db.add_event("pml_step_crash", {"step": step, "err": str(e), "ts": now()})
                 try:
                     self.db.mark_step(step["id"], "blocked")
                 except Exception:
@@ -1268,9 +1475,17 @@ class PMLRunner:
             if self.cfg.sleep_between > 0:
                 time.sleep(self.cfg.sleep_between)
 
-
+# ---------------------- CLI ----------------------
 def build_global_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(add_help=False)
+
+    # Presets / UX
+    p.add_argument("--full-pml", action="store_true", help="Enable everything (health enforced). Default cmd pml-loop.")
+    p.add_argument("--sude-pml", action="store_true", help="Enable everything except health enforcement. Default cmd pml-loop.")
+    p.add_argument("--sudo-pml", action="store_true", help="Alias for --sude-pml.")
+    p.add_argument("--force-lock", action="store_true", help="Override run.lock even if PID seems active.")
+
+    # LM config
     p.add_argument("--lm-url", default=os.environ.get("LMSTUDIO_URL", AppConfig.lm_url))
     p.add_argument("--lm-model", default=os.environ.get("LMSTUDIO_MODEL", AppConfig.lm_model))
 
@@ -1282,29 +1497,39 @@ def build_global_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-stream", dest="stream", action="store_false")
     p.set_defaults(stream=False)
 
-    p.add_argument(
-        "--timeout",
-        type=float,
-        default=0,
-        help="Request timeout seconds. 0 means no timeout.",
-    )
+    p.add_argument("--timeout", type=float, default=0, help="Request timeout seconds. 0 means no timeout.")
 
-    p.add_argument("--ctx-len", type=int, default=int(os.environ.get("LM_CTX_LEN", "4096")))
-    p.add_argument("--max-tokens", type=int, default=int(os.environ.get("LM_MAX_TOKENS", "2048")))
-    p.add_argument("--temperature", type=float, default=float(os.environ.get("LM_TEMPERATURE", "0.2")))
-    p.add_argument("--top-p", type=float, default=float(os.environ.get("LM_TOP_P", "0.9")))
+    p.add_argument("--ctx-len", type=int, default=int(os.environ.get("LM_CTX_LEN", str(AppConfig.ctx_len))))
+    p.add_argument("--max-tokens", type=int, default=int(os.environ.get("LM_MAX_TOKENS", str(AppConfig.max_tokens))))
+    p.add_argument("--temperature", type=float, default=float(os.environ.get("LM_TEMPERATURE", str(AppConfig.temperature))))
+    p.add_argument("--top-p", type=float, default=float(os.environ.get("LM_TOP_P", str(AppConfig.top_p))))
 
-    p.add_argument("--agent-calls", type=int, default=int(os.environ.get("AGENT_CALLS", "6")))
-    p.add_argument("--sleep-between", type=int, default=int(os.environ.get("SLEEP_BETWEEN", "0")))
+    p.add_argument("--agent-calls", type=int, default=int(os.environ.get("AGENT_CALLS", str(AppConfig.agent_calls))))
+    p.add_argument("--sleep-between", type=int, default=int(os.environ.get("SLEEP_BETWEEN", str(AppConfig.sleep_between))))
     p.add_argument("--loop-till-stopped", action="store_true")
 
+    p.add_argument("--max-iterations", type=int, default=int(os.environ.get("MAX_ITERATIONS", "0")), help="0 = unlimited")
+
+    # Monitor
     p.add_argument("--monitor", dest="monitor", action="store_true")
     p.add_argument("--no-monitor", dest="monitor", action="store_false")
     p.set_defaults(monitor=True)
 
-    p.add_argument("--max-gpu-temp", type=int, default=int(os.environ.get("MAX_GPU_TEMP", "86")))
-    p.add_argument("--cooldown", type=int, default=int(os.environ.get("COOLDOWN", "600")))
+    p.add_argument("--max-gpu-temp", type=int, default=int(os.environ.get("MAX_GPU_TEMP", str(AppConfig.max_gpu_temp_c))))
+    p.add_argument("--cooldown", type=int, default=int(os.environ.get("COOLDOWN", str(AppConfig.cooldown_s))))
 
+    p.add_argument("--max-vram-pct", type=int, default=int(os.environ.get("MAX_VRAM_PCT", str(AppConfig.max_vram_pct))))
+    p.add_argument("--max-ram-pct", type=int, default=int(os.environ.get("MAX_RAM_PCT", str(AppConfig.max_ram_pct))))
+
+    p.add_argument("--hard-exit", dest="hard_exit_on_crit", action="store_true")
+    p.add_argument("--no-hard-exit", dest="hard_exit_on_crit", action="store_false")
+    p.set_defaults(hard_exit_on_crit=False)
+
+    p.add_argument("--bypass-health", dest="bypass_health", action="store_true")
+    p.add_argument("--no-bypass-health", dest="bypass_health", action="store_false")
+    p.set_defaults(bypass_health=False)
+
+    # Safety
     p.add_argument("--auto-approve", dest="auto_approve", action="store_true")
     p.add_argument("--no-auto-approve", dest="auto_approve", action="store_false")
     p.set_defaults(auto_approve=True)
@@ -1313,6 +1538,7 @@ def build_global_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-safe-mode", dest="safe_mode", action="store_false")
     p.set_defaults(safe_mode=True)
 
+    # Git
     p.add_argument("--git-auto", dest="git_auto", action="store_true")
     p.add_argument("--no-git-auto", dest="git_auto", action="store_false")
     p.set_defaults(git_auto=True)
@@ -1321,16 +1547,23 @@ def build_global_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-git-push", dest="git_push", action="store_false")
     p.set_defaults(git_push=True)
 
-    p.add_argument("--git-interval", type=int, default=int(os.environ.get("GIT_INTERVAL", "300")))
+    p.add_argument("--git-interval", type=int, default=int(os.environ.get("GIT_INTERVAL", str(AppConfig.git_interval_s))))
 
-    p.add_argument("--pml-create", action="store_true", help="Compatibility: init PML + start loop")
+    # Idea generation
+    p.add_argument("--auto-generate-steps", dest="auto_generate_steps", action="store_true")
+    p.add_argument("--no-auto-generate-steps", dest="auto_generate_steps", action="store_false")
+    p.set_defaults(auto_generate_steps=False)
+    p.add_argument("--gen-steps-count", type=int, default=int(os.environ.get("GEN_STEPS_COUNT", str(AppConfig.gen_steps_count))))
+
+    # LM throttling
+    p.add_argument("--max-inflight-lm", type=int, default=int(os.environ.get("MAX_INFLIGHT_LM", str(AppConfig.max_inflight_lm))))
+    p.add_argument("--min-lm-interval", type=float, default=float(os.environ.get("MIN_LM_INTERVAL", str(AppConfig.min_lm_interval_s))))
 
     return p
 
-
 def build_cmd_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="project_me", description="Project Me PML agent")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="cmd", required=False)
 
     p_w = sub.add_parser("warmup", help="Test LM Studio connectivity")
     p_w.set_defaults(cmd="warmup")
@@ -1364,7 +1597,6 @@ def build_cmd_parser() -> argparse.ArgumentParser:
 
     return parser
 
-
 def merge_namespaces(a: argparse.Namespace, b: argparse.Namespace) -> argparse.Namespace:
     out = argparse.Namespace()
     for k, v in vars(a).items():
@@ -1373,39 +1605,48 @@ def merge_namespaces(a: argparse.Namespace, b: argparse.Namespace) -> argparse.N
         setattr(out, k, v)
     return out
 
-
-def load_cfg(global_ns: argparse.Namespace) -> AppConfig:
+def load_cfg(ns: argparse.Namespace) -> AppConfig:
     cfg = AppConfig()
-    cfg.lm_url = str(global_ns.lm_url)
-    cfg.lm_model = str(global_ns.lm_model)
-    cfg.stream = bool(global_ns.stream)
-    cfg.ssl_verify = bool(global_ns.ssl_verify)
+    cfg.lm_url = str(ns.lm_url)
+    cfg.lm_model = str(ns.lm_model)
+    cfg.stream = bool(ns.stream)
+    cfg.ssl_verify = bool(ns.ssl_verify)
+    cfg.timeout_s = None if float(ns.timeout) == 0 else float(ns.timeout)
 
-    cfg.timeout_s = None if float(global_ns.timeout) == 0 else float(global_ns.timeout)
+    cfg.ctx_len = int(ns.ctx_len)
+    cfg.max_tokens = int(ns.max_tokens)
+    cfg.temperature = float(ns.temperature)
+    cfg.top_p = float(ns.top_p)
 
-    cfg.ctx_len = int(global_ns.ctx_len)
-    cfg.max_tokens = int(global_ns.max_tokens)
-    cfg.temperature = float(global_ns.temperature)
-    cfg.top_p = float(global_ns.top_p)
+    cfg.agent_calls = int(ns.agent_calls)
+    cfg.sleep_between = int(ns.sleep_between)
+    cfg.loop_till_stopped = bool(ns.loop_till_stopped)
+    cfg.max_iterations = int(ns.max_iterations)
 
-    cfg.agent_calls = int(global_ns.agent_calls)
-    cfg.sleep_between = int(global_ns.sleep_between)
-    cfg.loop_till_stopped = bool(global_ns.loop_till_stopped)
+    cfg.monitor = bool(ns.monitor)
+    cfg.max_gpu_temp_c = int(ns.max_gpu_temp)
+    cfg.cooldown_s = int(ns.cooldown)
+    cfg.max_vram_pct = int(ns.max_vram_pct)
+    cfg.max_ram_pct = int(ns.max_ram_pct)
+    cfg.hard_exit_on_crit = bool(ns.hard_exit_on_crit)
+    cfg.bypass_health = bool(ns.bypass_health)
 
-    cfg.monitor = bool(global_ns.monitor)
-    cfg.max_gpu_temp_c = int(global_ns.max_gpu_temp)
-    cfg.cooldown_s = int(global_ns.cooldown)
+    cfg.auto_approve = bool(ns.auto_approve)
+    cfg.safe_mode = bool(ns.safe_mode)
 
-    cfg.auto_approve = bool(global_ns.auto_approve)
-    cfg.safe_mode = bool(global_ns.safe_mode)
+    cfg.git_auto = bool(ns.git_auto)
+    cfg.git_push = bool(ns.git_push)
+    cfg.git_interval_s = int(ns.git_interval)
 
-    cfg.git_auto = bool(global_ns.git_auto)
-    cfg.git_push = bool(global_ns.git_push)
-    cfg.git_interval_s = int(global_ns.git_interval)
+    cfg.auto_generate_steps = bool(ns.auto_generate_steps)
+    cfg.gen_steps_count = int(ns.gen_steps_count)
+
+    cfg.max_inflight_lm = int(ns.max_inflight_lm)
+    cfg.min_lm_interval_s = float(ns.min_lm_interval)
 
     return cfg
 
-
+# ---------------------- commands ----------------------
 def cmd_warmup(agent: Agent) -> None:
     log("Running warmup call…")
     answer, _ = agent.run_action_loop(
@@ -1415,7 +1656,6 @@ def cmd_warmup(agent: Agent) -> None:
         meta={"kind": "warmup"},
     )
     log(f"Warmup output: {answer!r}")
-
 
 def cmd_chat(agent: Agent, message: str) -> None:
     log("Starting one-shot chat…")
@@ -1429,7 +1669,6 @@ def cmd_chat(agent: Agent, message: str) -> None:
     print(answer)
     print("\n======================\n")
 
-
 def cmd_task(agent: Agent, prompt: str, mode: str, max_calls: int) -> None:
     log(f"Starting task: mode={mode} max_calls={max_calls}")
     answer, _ = agent.run_action_loop(
@@ -1442,7 +1681,6 @@ def cmd_task(agent: Agent, prompt: str, mode: str, max_calls: int) -> None:
     print(answer)
     print("\n===================\n")
 
-
 def cmd_status(paths: ProjectPaths, db: ProjectDB) -> None:
     print("\n--- Steps (latest 30) ---")
     for s in db.list_steps(limit=30):
@@ -1452,16 +1690,43 @@ def cmd_status(paths: ProjectPaths, db: ProjectDB) -> None:
     if paths.heartbeat_path.exists():
         try:
             hb = json.loads(paths.heartbeat_path.read_text(encoding="utf-8"))
-            gpu = hb.get("gpu")
-            cpu = hb.get("cpu")
-            print("cpu:", cpu)
-            print("gpu:", gpu)
+            print("cpu:", hb.get("cpu"))
+            print("gpu:", hb.get("gpu"))
         except Exception:
             print(paths.heartbeat_path.read_text(encoding="utf-8")[:1000])
     else:
         print("(no heartbeat yet)")
 
+# ---------------------- presets ----------------------
+def apply_presets(global_ns: argparse.Namespace) -> None:
+    # Treat --sudo-pml as alias
+    if getattr(global_ns, "sudo_pml", False):
+        setattr(global_ns, "sude_pml", True)
 
+    if getattr(global_ns, "full_pml", False) or getattr(global_ns, "sude_pml", False):
+        # enable the "everything" stack
+        global_ns.git_auto = True
+        global_ns.git_push = True
+        global_ns.auto_generate_steps = True
+        global_ns.gen_steps_count = getattr(global_ns, "gen_steps_count", 8) or 8
+        global_ns.loop_till_stopped = True
+        global_ns.max_iterations = 0  # unlimited
+        global_ns.agent_calls = max(6, int(getattr(global_ns, "agent_calls", 6) or 6))
+        global_ns.sleep_between = int(getattr(global_ns, "sleep_between", 5) or 5)
+        global_ns.ctx_len = int(getattr(global_ns, "ctx_len", 2048) or 2048)
+        global_ns.max_tokens = int(getattr(global_ns, "max_tokens", 512) or 512)
+        global_ns.max_inflight_lm = 1
+        global_ns.min_lm_interval = float(getattr(global_ns, "min_lm_interval", 2) or 2)
+
+        # health behavior differs by preset
+        if getattr(global_ns, "sude_pml", False):
+            global_ns.bypass_health = True
+            global_ns.hard_exit_on_crit = False
+        else:
+            global_ns.bypass_health = False
+            global_ns.hard_exit_on_crit = False
+
+# ---------------------- main ----------------------
 def main(argv: Optional[List[str]] = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
 
@@ -1469,7 +1734,26 @@ def main(argv: Optional[List[str]] = None) -> None:
     paths = ProjectPaths(base_dir)
     paths.ensure()
 
-    lock = SingleInstanceLock(paths.lock_path)
+    gp = build_global_parser()
+    global_ns, remainder = gp.parse_known_args(argv)
+
+    apply_presets(global_ns)
+
+    # If user used presets and did not supply a command, default to pml-loop
+    if (getattr(global_ns, "full_pml", False) or getattr(global_ns, "sude_pml", False) or getattr(global_ns, "sudo_pml", False)) and not remainder:
+        remainder = ["pml-loop"]
+
+    cp = build_cmd_parser()
+    cmd_ns = cp.parse_args(remainder)
+
+    if not getattr(cmd_ns, "cmd", None):
+        cp.print_help()
+        sys.exit(2)
+
+    ns = merge_namespaces(global_ns, cmd_ns)
+    cfg = load_cfg(ns)
+
+    lock = SingleInstanceLock(paths.lock_path, force=bool(getattr(ns, "force_lock", False)))
     lock.acquire()
 
     def _cleanup(*_: Any) -> None:
@@ -1487,17 +1771,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         except Exception:
             pass
 
-    gp = build_global_parser()
-    global_ns, remainder = gp.parse_known_args(argv)
-
-    cp = build_cmd_parser()
-    cmd_ns = cp.parse_args(remainder)
-
-    ns = merge_namespaces(global_ns, cmd_ns)
-
-    cfg = load_cfg(global_ns)
-
-    log(f"[LM] Using LM Studio at {cfg.lm_url} model='{cfg.lm_model}'")
+    log(f"[LM] Using LM Studio at {cfg.lm_url} model='{cfg.lm_model}' (ctx={cfg.ctx_len}, max_tokens={cfg.max_tokens})")
 
     db = ProjectDB(paths.db_path)
     ws = Workspace(paths)
@@ -1514,12 +1788,6 @@ def main(argv: Optional[List[str]] = None) -> None:
     runner = PMLRunner(cfg, paths, db, agent, tools, steps, git)
 
     try:
-        if getattr(ns, "pml_create", False):
-            log("[CLI] --pml-create set; starting pml-loop")
-            cfg.loop_till_stopped = True
-            runner.loop()
-            return
-
         if ns.cmd == "warmup":
             cmd_warmup(agent)
         elif ns.cmd == "chat":
@@ -1532,11 +1800,9 @@ def main(argv: Optional[List[str]] = None) -> None:
             log("[PML] Initialized.")
         elif ns.cmd == "pml-step":
             step = None
-            if ns.step_id:
-                step = {"id": ns.step_id, "phase": "pml", "title": ns.step_id, "body": "", "status": "todo"}
+            if getattr(ns, "step_id", ""):
                 full = steps._get_step_full(ns.step_id)
-                if full:
-                    step = full
+                step = full or {"id": ns.step_id, "phase": "pml", "title": ns.step_id, "body": "", "status": "todo"}
             else:
                 step = db.next_pending_step()
             if not step:
@@ -1546,9 +1812,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         elif ns.cmd == "pml-loop":
             runner.loop()
         elif ns.cmd == "gen-steps":
-            runner._generate_more_steps(ns.reason)
+            runner._generate_more_steps(getattr(ns, "reason", "manual"))
         else:
-            raise RuntimeError(f"Unknown cmd: {ns}")
+            raise RuntimeError(f"Unknown cmd: {ns.cmd}")
     finally:
         try:
             db.close()
@@ -1559,7 +1825,6 @@ def main(argv: Optional[List[str]] = None) -> None:
         except Exception:
             pass
         lock.release()
-
 
 if __name__ == "__main__":
     main()
