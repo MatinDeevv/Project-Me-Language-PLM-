@@ -1,0 +1,45 @@
+{
+  "root": "C:\\Users\\matin\\PythonProject5\\pml",
+  "files": [
+    {
+      "relpath": "last_context.json",
+      "kind": "state",
+      "size": 12235
+    },
+    {
+      "relpath": "pml_index.json",
+      "kind": "state",
+      "size": 845
+    },
+    {
+      "relpath": "pml_memory.jsonl",
+      "kind": "other",
+      "size": 5046
+    },
+    {
+      "relpath": "pml_state.json",
+      "kind": "state",
+      "size": 172
+    },
+    {
+      "relpath": "pml_steps.json",
+      "kind": "state",
+      "size": 841
+    },
+    {
+      "relpath": "docs\\pml_examples.md",
+      "kind": "doc",
+      "size": 155
+    },
+    {
+      "relpath": "docs\\pml_spec.md",
+      "kind": "doc",
+      "size": 1241
+    },
+    {
+      "relpath": "logs\\health.jsonl",
+      "kind": "other",
+      "size": 154
+    }
+  ]
+}

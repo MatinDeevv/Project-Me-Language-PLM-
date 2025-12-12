@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "iterations": 1,
+  "last_phase": "spec_bootstrap",
+  "last_run_ts": 1765508016.164581,
+  "total_lm_calls": 0,
+  "approx_total_output_tokens": 0
+}
