@@ -18,12 +18,12 @@
     "goal": "Draft a minimal PML syntax (module/type/fn/import/let/effects) in pml/docs/01_syntax.md, keeping it short but explicit.",
     "phase": "spec",
     "mode": "docs",
-    "status": "done",
+    "status": "pending",
     "created_at": 1765509346.1470513,
-    "updated_at": 1765509977.101085,
-    "attempts": 1,
+    "updated_at": 1765509346.1470518,
+    "attempts": 0,
     "last_error": null,
-    "last_result": "{\"action\": \"write_file\", \"tool_args\": {\"path\": \"pml/docs/01_syntax.md\", \"content\": \"# PML Syntax (Draft)\\n\\nThis file will evolve. Start simple, then formalize.\\n\\n## Core primitives\\n\\n- `module` - defines a module\\n- `type` - defines a type\\n- `fn` - defines a function\\n- `import` - imports another module\\n- `let` - declares a variable\\n- `effect` - declares an effect (IO, exec, etc.)\\n\\n## Example\\n\\n```pml\\nmodule hello\\n\\ntype Greeting = str\\n\\nfn main() -> Greeting {\\n  let msg: Greeting = \\\"hello\\\"\\n  return msg\\n}\\n\\nimport std.io as io\\n\\neffect IO\\n\\nfn print_hello() -> IO {\\n  io.println(\\\"Hello, world!\\\")\\n}\\n```\"}}\n```"
+    "last_result": null
   },
   {
     "id": "compiler-0001",
