@@ -4,7 +4,7 @@
     "phase": "compiler",
     "title": "Compiler plan",
     "body": "Design compilation pipeline to Python: parse -> IR -> emit. Keep it minimal. Define acceptance tests.",
-    "status": "todo"
+    "status": "done"
   },
   {
     "id": "runtime-0001",
@@ -18,6 +18,6 @@
     "phase": "spec",
     "title": "Define PML syntax sketch",
     "body": "Write a compact syntax sketch: modules, contracts, pipelines. Store in pml/PML.md (append).",
-    "status": "todo"
+    "status": "done"
   }
 ]
