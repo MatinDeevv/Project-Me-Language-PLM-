@@ -1,7 +1,6 @@
 # PML (Project Me Language)
 
-PML is a tiny, practical DSL whose purpose is to describe long-lived software systems at a higher level than Python,
-while compiling into plain Python.
+PML is a tiny, practical DSL whose purpose is to **describe large, long-lived software systems** at a higher level than Python, while still compiling into **plain Python**.
 
 ## Design goals
 - Human-readable enough to review, but structured enough for the agent to transform.
@@ -10,14 +9,15 @@ while compiling into plain Python.
 - Keeps files minimal (prefer a few well-named modules over file explosions).
 
 ## Core concepts
-- Unit: module or component.
-- Contract: interface + invariants.
-- Pipeline: ordered execution phases.
-- Step: atomic iteration task the agent executes.
+- **Unit**: a module or component.
+- **Contract**: interface + invariants.
+- **Pipeline**: ordered execution phases.
+- **Step**: atomic iteration task the agent executes.
 
 ## Step JSON format
-pml/steps.json is the agent’s work queue.
-Each item:
+`pml/steps.json` is the agent’s work queue.
+Each item is:
+```json
 {
   "id": "runtime-0001",
   "phase": "runtime",
@@ -25,11 +25,12 @@ Each item:
   "body": "What to build/change and acceptance criteria",
   "status": "todo"
 }
+```
 
 ## Runtime principle
 The agent should:
 1. Read current workspace.
 2. Execute exactly one step.
 3. Save progress immediately.
-4. Avoid infinite loops unless explicitly enabled.
+4. Auto-generate new steps when queue is empty (optional).
 
