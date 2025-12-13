@@ -1,18 +1,18 @@
 {
-  "ts": 1765589265.2070658,
+  "ts": 1765589597.7111847,
   "cpu": {
     "ok": true,
-    "cpu_pct": 44.4,
-    "ram_pct": 80.6,
-    "ram_used_gb": 25.48,
+    "cpu_pct": 46.0,
+    "ram_pct": 80.8,
+    "ram_used_gb": 25.56,
     "ram_total_gb": 31.63
   },
   "gpu": {
     "ok": true,
-    "temp_c": 73,
-    "mem_used_mb": 3878,
+    "temp_c": 71,
+    "mem_used_mb": 3874,
     "mem_total_mb": 4096,
-    "util_pct": 86,
+    "util_pct": 92,
     "vram_pct": 95
   },
   "disk": {

@@ -4,6 +4,34 @@
     "phase": "compiler",
     "title": "Compiler plan",
     "body": "Design compilation pipeline to Python: parse -> IR -> emit. Create pml/compiler.py stub and a tiny unit test. Keep it minimal.",
+    "status": "blocked"
+  },
+  {
+    "id": "compiler-0002",
+    "phase": "compiler",
+    "title": "Implement the PML compiler",
+    "body": "",
+    "status": "blocked"
+  },
+  {
+    "id": "compiler-0003",
+    "phase": "compiler",
+    "title": "Improve the efficiency of the compiler",
+    "body": "",
+    "status": "todo"
+  },
+  {
+    "id": "docs-0002",
+    "phase": "docs",
+    "title": "Update documentation with new features",
+    "body": "",
+    "status": "blocked"
+  },
+  {
+    "id": "docs-0003",
+    "phase": "docs",
+    "title": "Create a detailed guide for using PML",
+    "body": "",
     "status": "todo"
   },
   {
@@ -14,10 +42,38 @@
     "status": "blocked"
   },
   {
+    "id": "runtime-0002",
+    "phase": "runtime",
+    "title": "Add error handling to runtime",
+    "body": "",
+    "status": "blocked"
+  },
+  {
+    "id": "runtime-0003",
+    "phase": "runtime",
+    "title": "Add support for importing and using modules in PML code",
+    "body": "",
+    "status": "blocked"
+  },
+  {
     "id": "spec-0001",
     "phase": "spec",
     "title": "Define PML syntax sketch",
     "body": "Write a compact syntax sketch: modules, contracts, pipelines. Store in pml/PML.md (append).",
+    "status": "blocked"
+  },
+  {
+    "id": "tests-0001",
+    "phase": "tests",
+    "title": "Write unit tests for the runtime and compiler",
+    "body": "",
+    "status": "blocked"
+  },
+  {
+    "id": "tests-0002",
+    "phase": "tests",
+    "title": "Expand unit tests to cover new features and improvements",
+    "body": "",
     "status": "todo"
   }
 ]
