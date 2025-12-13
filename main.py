@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
 
 import requests
 
+
 # --- Optional dependency (psutil) ---
 def try_import_psutil():
     try:
@@ -26,30 +27,38 @@ def try_import_psutil():
     except Exception:
         return None
 
+
 ActionType = Literal["tool", "final"]
+
 
 # ---------------------- utils ----------------------
 def _ts() -> str:
     return time.strftime("%H:%M:%S")
 
+
 def now() -> float:
     return time.time()
+
 
 def log(msg: str) -> None:
     tid = threading.get_ident()
     print(f"[{_ts()}][T{tid}] {msg}", flush=True)
 
+
 def jdump(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
+
 def clamp_int(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
+
 
 def _safe_int(x: Any, default: int = 0) -> int:
     try:
         return int(x)
     except Exception:
         return default
+
 
 # ---------------------- config ----------------------
 @dataclass
@@ -107,6 +116,7 @@ class AppConfig:
     max_inflight_lm: int = 1
     min_lm_interval_s: float = 2.0
 
+
 # ---------------------- paths ----------------------
 class ProjectPaths:
     def __init__(self, base_dir: Path):
@@ -121,6 +131,7 @@ class ProjectPaths:
 
     def ensure(self) -> None:
         self.pml_dir.mkdir(parents=True, exist_ok=True)
+
 
 # ---------------------- lock ----------------------
 def _pid_is_running(pid: int) -> bool:
@@ -153,6 +164,7 @@ def _pid_is_running(pid: int) -> bool:
             return True
         except Exception:
             return False
+
 
 class SingleInstanceLock:
     def __init__(self, lock_path: Path, *, force: bool = False):
@@ -192,6 +204,7 @@ class SingleInstanceLock:
             self.lock_path.unlink(missing_ok=True)  # type: ignore[arg-type]
         except Exception:
             pass
+
 
 # ---------------------- health monitor ----------------------
 class HealthMonitor:
@@ -248,8 +261,8 @@ class HealthMonitor:
                 "ok": True,
                 "cpu_pct": cpu,
                 "ram_pct": float(vm.percent),
-                "ram_used_gb": round(vm.used / (1024**3), 2),
-                "ram_total_gb": round(vm.total / (1024**3), 2),
+                "ram_used_gb": round(vm.used / (1024 ** 3), 2),
+                "ram_total_gb": round(vm.total / (1024 ** 3), 2),
             }
         except Exception as e:
             return {"ok": False, "err": str(e)}
@@ -259,8 +272,8 @@ class HealthMonitor:
             usage = shutil.disk_usage(self.paths.base_dir)
             return {
                 "ok": True,
-                "free_gb": round(usage.free / (1024**3), 2),
-                "total_gb": round(usage.total / (1024**3), 2),
+                "free_gb": round(usage.free / (1024 ** 3), 2),
+                "total_gb": round(usage.total / (1024 ** 3), 2),
             }
         except Exception as e:
             return {"ok": False, "err": str(e)}
@@ -334,6 +347,7 @@ class HealthMonitor:
 
             time.sleep(self.cfg.monitor_interval_s)
 
+
 # ---------------------- LM client (with throttle) ----------------------
 class _RateLimiter:
     def __init__(self, min_interval_s: float):
@@ -349,6 +363,7 @@ class _RateLimiter:
             if dt < self.min_interval_s:
                 time.sleep(self.min_interval_s - dt)
             self._last = now()
+
 
 class LMStudioClient:
     def __init__(self, cfg: AppConfig):
@@ -377,13 +392,13 @@ class LMStudioClient:
         return resp
 
     def chat(
-        self,
-        messages: List[Dict[str, str]],
-        *,
-        max_tokens: int,
-        temperature: float,
-        top_p: float,
-        stream: bool,
+            self,
+            messages: List[Dict[str, str]],
+            *,
+            max_tokens: int,
+            temperature: float,
+            top_p: float,
+            stream: bool,
     ) -> str:
         payload: Dict[str, Any] = {
             "model": self.cfg.lm_model,
@@ -418,7 +433,7 @@ class LMStudioClient:
             if not line:
                 continue
             if line.startswith("data:"):
-                line = line[len("data:") :].strip()
+                line = line[len("data:"):].strip()
             if line == "[DONE]":
                 break
             try:
@@ -432,6 +447,7 @@ class LMStudioClient:
                 sys.stdout.write(token)
                 sys.stdout.flush()
         return "".join(out)
+
 
 # ---------------------- token budget ----------------------
 class TokenBudgeter:
@@ -453,16 +469,16 @@ class TokenBudgeter:
         if len(text) <= max_chars:
             return text
         head = text[: max_chars // 2]
-        tail = text[-max_chars // 2 :]
+        tail = text[-max_chars // 2:]
         return head + "\n…<snip>…\n" + tail
 
     def fit(
-        self,
-        messages: List[Dict[str, str]],
-        *,
-        reserve_output_tokens: int,
-        max_workspace_chars: int,
-        max_rag_chars: int,
+            self,
+            messages: List[Dict[str, str]],
+            *,
+            reserve_output_tokens: int,
+            max_workspace_chars: int,
+            max_rag_chars: int,
     ) -> List[Dict[str, str]]:
         ctx = int(self.cfg.ctx_len)
         reserve = int(reserve_output_tokens)
@@ -477,7 +493,8 @@ class TokenBudgeter:
                     trimmed.append({"role": "system", "content": self.shrink_text(c, 3000)})
                     continue
                 if "PML workspace" in c:
-                    trimmed.append({"role": m.get("role", "system"), "content": self.shrink_text(c, max_workspace_chars)})
+                    trimmed.append(
+                        {"role": m.get("role", "system"), "content": self.shrink_text(c, max_workspace_chars)})
                 elif c.startswith("Relevant memory"):
                     trimmed.append({"role": m.get("role", "system"), "content": self.shrink_text(c, max_rag_chars)})
                 else:
@@ -504,6 +521,7 @@ class TokenBudgeter:
             ms.pop(1)
 
         return ms
+
 
 # ---------------------- db ----------------------
 class ProjectDB:
@@ -697,6 +715,7 @@ class ProjectDB:
             )
             self.conn.commit()
 
+
 # ---------------------- workspace / tools ----------------------
 class Workspace:
     def __init__(self, paths: ProjectPaths):
@@ -736,6 +755,7 @@ class Workspace:
                 break
             out.append(line)
         return "\n".join(out)
+
 
 class ToolRunner:
     def __init__(self, cfg: AppConfig, ws: Workspace):
@@ -884,8 +904,10 @@ class ToolRunner:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+
 # ---------------------- JSON extraction ----------------------
 JsonValue = Union[Dict[str, Any], List[Any]]
+
 
 def extract_first_json_value(text: str) -> Optional[JsonValue]:
     """
@@ -934,7 +956,7 @@ def extract_first_json_value(text: str) -> Optional[JsonValue]:
             elif ch == close_ch:
                 depth -= 1
                 if depth == 0:
-                    snippet = t[start : i + 1]
+                    snippet = t[start: i + 1]
                     try:
                         val = json.loads(snippet)
                         if isinstance(val, (dict, list)):
@@ -942,6 +964,7 @@ def extract_first_json_value(text: str) -> Optional[JsonValue]:
                     except Exception:
                         return None
     return None
+
 
 def normalize_action(obj: Dict[str, Any]) -> Dict[str, Any]:
     if "action" in obj:
@@ -951,6 +974,7 @@ def normalize_action(obj: Dict[str, Any]) -> Dict[str, Any]:
         log("[AGENT] Normalizing action_schema wrapper")
         return schema
     return obj
+
 
 # ---------------------- Agent ----------------------
 class Agent:
@@ -972,19 +996,19 @@ class Agent:
         }.get(mode, "Bias: auto.")
 
         return (
-            "You are Project Me: a senior full-stack engineer + systems architect.\n"
-            f"{role_hint}\n\n"
-            "Rules:\n"
-            "- ALWAYS use tools to inspect workspace before writing/renaming/deleting.\n"
-            "- Keep diffs minimal when editing existing code.\n"
-            "- Prefer few files. Avoid file explosions.\n"
-            "- When asked to generate steps, output a JSON ARRAY of step objects (not an action object).\n"
-            "- Otherwise output EXACTLY ONE JSON OBJECT matching the action schema.\n"
-            "- No markdown, no extra commentary.\n\n"
-            + self.tools.tools_schema()
-            + "\nAction schema (choose ONE):\n"
-            + '{"action":"tool","tool_name":"list_dir","tool_args":{},"reasoning":"short"}\n'
-            + '{"action":"final","answer":"plain text answer","reasoning":"short"}\n'
+                "You are Project Me: a senior full-stack engineer + systems architect.\n"
+                f"{role_hint}\n\n"
+                "Rules:\n"
+                "- ALWAYS use tools to inspect workspace before writing/renaming/deleting.\n"
+                "- Keep diffs minimal when editing existing code.\n"
+                "- Prefer few files. Avoid file explosions.\n"
+                "- When asked to generate steps, output a JSON ARRAY of step objects (not an action object).\n"
+                "- Otherwise output EXACTLY ONE JSON OBJECT matching the action schema.\n"
+                "- No markdown, no extra commentary.\n\n"
+                + self.tools.tools_schema()
+                + "\nAction schema (choose ONE):\n"
+                + '{"action":"tool","tool_name":"list_dir","tool_args":{},"reasoning":"short"}\n'
+                + '{"action":"final","answer":"plain text answer","reasoning":"short"}\n'
         )
 
     def _rag_context(self, prompt: str) -> str:
@@ -1029,8 +1053,8 @@ class Agent:
                 smaller = []
                 for m in fitted:
                     if m.get("role") == "system" and (
-                        m.get("content", "").startswith("PML workspace")
-                        or m.get("content", "").startswith("Relevant memory")
+                            m.get("content", "").startswith("PML workspace")
+                            or m.get("content", "").startswith("Relevant memory")
                     ):
                         continue
                     smaller.append(m)
@@ -1050,12 +1074,12 @@ class Agent:
             raise
 
     def run_action_loop(
-        self,
-        *,
-        prompt: str,
-        mode: str,
-        max_calls: int,
-        meta: Dict[str, Any],
+            self,
+            *,
+            prompt: str,
+            mode: str,
+            max_calls: int,
+            meta: Dict[str, Any],
     ) -> Tuple[str, List[Dict[str, Any]]]:
         system = self._system_prompt(mode)
         ws_ctx = self._workspace_context()
@@ -1094,7 +1118,14 @@ class Agent:
             action = str(obj.get("action", "final")).lower()
 
             if action == "final":
-                answer = str(obj.get("answer") or "").strip() or raw.strip()
+                val = obj.get("answer")
+                if val is None or val == "":
+                    answer = raw.strip()
+                elif isinstance(val, str):
+                    answer = val.strip()
+                else:
+                    # Preserve JSON types (lists/dicts/bools/numbers) as JSON, not Python repr
+                    answer = json.dumps(val, ensure_ascii=False)
                 self.db.add_memory(prompt, answer, {**meta, "tool_calls": tool_calls, "mode": mode})
                 return answer, tool_calls
 
@@ -1118,19 +1149,21 @@ class Agent:
                     {
                         "role": "user",
                         "content": "Tool result:\n```json\n" + json.dumps(result, indent=2) + "\n```\n"
-                        "Use this observation. Either call another tool or return action=final.",
+                                                                                              "Use this observation. Either call another tool or return action=final.",
                     }
                 )
                 continue
 
             # unknown action: return raw
             answer = raw.strip()
-            self.db.add_memory(prompt, answer, {**meta, "tool_calls": tool_calls, "mode": mode, "unknown_action": action})
+            self.db.add_memory(prompt, answer,
+                               {**meta, "tool_calls": tool_calls, "mode": mode, "unknown_action": action})
             return answer, tool_calls
 
         answer = last_raw.strip()
         self.db.add_memory(prompt, answer, {**meta, "tool_calls": tool_calls, "mode": mode, "max_calls": max_calls})
         return answer, tool_calls
+
 
 # ---------------------- PML docs / steps ----------------------
 PML_DOCS = """# PML (Project Me Language)
@@ -1171,6 +1204,7 @@ The agent should:
 
 """
 
+
 def default_seed_steps() -> List[Dict[str, Any]]:
     return [
         {
@@ -1195,6 +1229,7 @@ def default_seed_steps() -> List[Dict[str, Any]]:
             "status": "todo",
         },
     ]
+
 
 class PMLSteps:
     def __init__(self, paths: ProjectPaths, db: ProjectDB):
@@ -1253,6 +1288,7 @@ class PMLSteps:
             return None
         return {"id": r[0], "phase": r[1], "title": r[2], "body": r[3], "status": r[4]}
 
+
 # ---------------------- Git backup ----------------------
 class GitBackup:
     def __init__(self, cfg: AppConfig, tools: ToolRunner):
@@ -1274,11 +1310,14 @@ class GitBackup:
         except Exception as e:
             log(f"[GIT] Backup failed: {e}")
 
+
 # ---------------------- PML Runner ----------------------
 _MUTATING_TOOLS = {"write_file", "mkdir", "move_path", "delete_path", "git_commit_push"}
 
+
 class PMLRunner:
-    def __init__(self, cfg: AppConfig, paths: ProjectPaths, db: ProjectDB, agent: Agent, tools: ToolRunner, steps: PMLSteps, git: GitBackup):
+    def __init__(self, cfg: AppConfig, paths: ProjectPaths, db: ProjectDB, agent: Agent, tools: ToolRunner,
+                 steps: PMLSteps, git: GitBackup):
         self.cfg = cfg
         self.paths = paths
         self.db = db
@@ -1451,7 +1490,12 @@ class PMLRunner:
                 if self.cfg.auto_generate_steps:
                     self._generate_more_steps("queue empty")
                     step = self.db.next_pending_step()
+
                 if not step:
+                    if self.cfg.loop_till_stopped:
+                        log("[PML] Still no steps after generation. Sleeping 15s and retrying.")
+                        time.sleep(15)
+                        continue
                     log("[PML] Still no steps. Exiting.")
                     break
 
@@ -1475,13 +1519,15 @@ class PMLRunner:
             if self.cfg.sleep_between > 0:
                 time.sleep(self.cfg.sleep_between)
 
+
 # ---------------------- CLI ----------------------
 def build_global_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(add_help=False)
 
     # Presets / UX
     p.add_argument("--full-pml", action="store_true", help="Enable everything (health enforced). Default cmd pml-loop.")
-    p.add_argument("--sude-pml", action="store_true", help="Enable everything except health enforcement. Default cmd pml-loop.")
+    p.add_argument("--sude-pml", action="store_true",
+                   help="Enable everything except health enforcement. Default cmd pml-loop.")
     p.add_argument("--sudo-pml", action="store_true", help="Alias for --sude-pml.")
     p.add_argument("--force-lock", action="store_true", help="Override run.lock even if PID seems active.")
 
@@ -1501,21 +1547,25 @@ def build_global_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--ctx-len", type=int, default=int(os.environ.get("LM_CTX_LEN", str(AppConfig.ctx_len))))
     p.add_argument("--max-tokens", type=int, default=int(os.environ.get("LM_MAX_TOKENS", str(AppConfig.max_tokens))))
-    p.add_argument("--temperature", type=float, default=float(os.environ.get("LM_TEMPERATURE", str(AppConfig.temperature))))
+    p.add_argument("--temperature", type=float,
+                   default=float(os.environ.get("LM_TEMPERATURE", str(AppConfig.temperature))))
     p.add_argument("--top-p", type=float, default=float(os.environ.get("LM_TOP_P", str(AppConfig.top_p))))
 
     p.add_argument("--agent-calls", type=int, default=int(os.environ.get("AGENT_CALLS", str(AppConfig.agent_calls))))
-    p.add_argument("--sleep-between", type=int, default=int(os.environ.get("SLEEP_BETWEEN", str(AppConfig.sleep_between))))
+    p.add_argument("--sleep-between", type=int,
+                   default=int(os.environ.get("SLEEP_BETWEEN", str(AppConfig.sleep_between))))
     p.add_argument("--loop-till-stopped", action="store_true")
 
-    p.add_argument("--max-iterations", type=int, default=int(os.environ.get("MAX_ITERATIONS", "0")), help="0 = unlimited")
+    p.add_argument("--max-iterations", type=int, default=int(os.environ.get("MAX_ITERATIONS", "0")),
+                   help="0 = unlimited")
 
     # Monitor
     p.add_argument("--monitor", dest="monitor", action="store_true")
     p.add_argument("--no-monitor", dest="monitor", action="store_false")
     p.set_defaults(monitor=True)
 
-    p.add_argument("--max-gpu-temp", type=int, default=int(os.environ.get("MAX_GPU_TEMP", str(AppConfig.max_gpu_temp_c))))
+    p.add_argument("--max-gpu-temp", type=int,
+                   default=int(os.environ.get("MAX_GPU_TEMP", str(AppConfig.max_gpu_temp_c))))
     p.add_argument("--cooldown", type=int, default=int(os.environ.get("COOLDOWN", str(AppConfig.cooldown_s))))
 
     p.add_argument("--max-vram-pct", type=int, default=int(os.environ.get("MAX_VRAM_PCT", str(AppConfig.max_vram_pct))))
@@ -1547,19 +1597,24 @@ def build_global_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-git-push", dest="git_push", action="store_false")
     p.set_defaults(git_push=True)
 
-    p.add_argument("--git-interval", type=int, default=int(os.environ.get("GIT_INTERVAL", str(AppConfig.git_interval_s))))
+    p.add_argument("--git-interval", type=int,
+                   default=int(os.environ.get("GIT_INTERVAL", str(AppConfig.git_interval_s))))
 
     # Idea generation
     p.add_argument("--auto-generate-steps", dest="auto_generate_steps", action="store_true")
     p.add_argument("--no-auto-generate-steps", dest="auto_generate_steps", action="store_false")
     p.set_defaults(auto_generate_steps=False)
-    p.add_argument("--gen-steps-count", type=int, default=int(os.environ.get("GEN_STEPS_COUNT", str(AppConfig.gen_steps_count))))
+    p.add_argument("--gen-steps-count", type=int,
+                   default=int(os.environ.get("GEN_STEPS_COUNT", str(AppConfig.gen_steps_count))))
 
     # LM throttling
-    p.add_argument("--max-inflight-lm", type=int, default=int(os.environ.get("MAX_INFLIGHT_LM", str(AppConfig.max_inflight_lm))))
-    p.add_argument("--min-lm-interval", type=float, default=float(os.environ.get("MIN_LM_INTERVAL", str(AppConfig.min_lm_interval_s))))
+    p.add_argument("--max-inflight-lm", type=int,
+                   default=int(os.environ.get("MAX_INFLIGHT_LM", str(AppConfig.max_inflight_lm))))
+    p.add_argument("--min-lm-interval", type=float,
+                   default=float(os.environ.get("MIN_LM_INTERVAL", str(AppConfig.min_lm_interval_s))))
 
     return p
+
 
 def build_cmd_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="project_me", description="Project Me PML agent")
@@ -1593,9 +1648,16 @@ def build_cmd_parser() -> argparse.ArgumentParser:
 
     p_gen = sub.add_parser("gen-steps", help="Ask the model to generate more steps")
     p_gen.add_argument("--reason", default="manual")
+
+    p_unblock = sub.add_parser("pml-unblock", help="Reset blocked steps back to todo (all or by id)")
+    p_unblock.add_argument("--id", dest="step_id", default="",
+                           help="Specific step id to unblock. If empty, unblocks all.")
+    p_unblock.set_defaults(cmd="pml-unblock")
+
     p_gen.set_defaults(cmd="gen-steps")
 
     return parser
+
 
 def merge_namespaces(a: argparse.Namespace, b: argparse.Namespace) -> argparse.Namespace:
     out = argparse.Namespace()
@@ -1604,6 +1666,7 @@ def merge_namespaces(a: argparse.Namespace, b: argparse.Namespace) -> argparse.N
     for k, v in vars(b).items():
         setattr(out, k, v)
     return out
+
 
 def load_cfg(ns: argparse.Namespace) -> AppConfig:
     cfg = AppConfig()
@@ -1646,6 +1709,7 @@ def load_cfg(ns: argparse.Namespace) -> AppConfig:
 
     return cfg
 
+
 # ---------------------- commands ----------------------
 def cmd_warmup(agent: Agent) -> None:
     log("Running warmup call…")
@@ -1656,6 +1720,7 @@ def cmd_warmup(agent: Agent) -> None:
         meta={"kind": "warmup"},
     )
     log(f"Warmup output: {answer!r}")
+
 
 def cmd_chat(agent: Agent, message: str) -> None:
     log("Starting one-shot chat…")
@@ -1669,6 +1734,7 @@ def cmd_chat(agent: Agent, message: str) -> None:
     print(answer)
     print("\n======================\n")
 
+
 def cmd_task(agent: Agent, prompt: str, mode: str, max_calls: int) -> None:
     log(f"Starting task: mode={mode} max_calls={max_calls}")
     answer, _ = agent.run_action_loop(
@@ -1680,6 +1746,7 @@ def cmd_task(agent: Agent, prompt: str, mode: str, max_calls: int) -> None:
     print("\n=== TASK RESULT ===\n")
     print(answer)
     print("\n===================\n")
+
 
 def cmd_status(paths: ProjectPaths, db: ProjectDB) -> None:
     print("\n--- Steps (latest 30) ---")
@@ -1696,6 +1763,7 @@ def cmd_status(paths: ProjectPaths, db: ProjectDB) -> None:
             print(paths.heartbeat_path.read_text(encoding="utf-8")[:1000])
     else:
         print("(no heartbeat yet)")
+
 
 # ---------------------- presets ----------------------
 def apply_presets(global_ns: argparse.Namespace) -> None:
@@ -1726,6 +1794,7 @@ def apply_presets(global_ns: argparse.Namespace) -> None:
             global_ns.bypass_health = False
             global_ns.hard_exit_on_crit = False
 
+
 # ---------------------- main ----------------------
 def main(argv: Optional[List[str]] = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -1740,7 +1809,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     apply_presets(global_ns)
 
     # If user used presets and did not supply a command, default to pml-loop
-    if (getattr(global_ns, "full_pml", False) or getattr(global_ns, "sude_pml", False) or getattr(global_ns, "sudo_pml", False)) and not remainder:
+    if (getattr(global_ns, "full_pml", False) or getattr(global_ns, "sude_pml", False) or getattr(global_ns, "sudo_pml",
+                                                                                                  False)) and not remainder:
         remainder = ["pml-loop"]
 
     cp = build_cmd_parser()
@@ -1813,6 +1883,22 @@ def main(argv: Optional[List[str]] = None) -> None:
             runner.loop()
         elif ns.cmd == "gen-steps":
             runner._generate_more_steps(getattr(ns, "reason", "manual"))
+        elif ns.cmd == "pml-unblock":
+            sid = str(getattr(ns, "step_id", "") or "").strip()
+            with db._lock:
+                if sid:
+                    cur = db.conn.execute(
+                        "UPDATE steps SET status='todo', updated=? WHERE id=? AND status='blocked'",
+                        (now(), sid),
+                    )
+                else:
+                    cur = db.conn.execute(
+                        "UPDATE steps SET status='todo', updated=? WHERE status='blocked'",
+                        (now(),),
+                    )
+                db.conn.commit()
+            steps.export_steps_json()
+            log(f"[PML] Unblocked {cur.rowcount} step(s).")
         else:
             raise RuntimeError(f"Unknown cmd: {ns.cmd}")
     finally:
@@ -1825,6 +1911,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         except Exception:
             pass
         lock.release()
+
 
 if __name__ == "__main__":
     main()

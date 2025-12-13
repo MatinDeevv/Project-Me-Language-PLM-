@@ -11,21 +11,21 @@
     "phase": "compiler",
     "title": "Implement the PML compiler to generate Python code from PML ASTs",
     "body": "",
-    "status": "todo"
+    "status": "blocked"
   },
   {
     "id": "compiler-0004",
     "phase": "compiler",
     "title": "Optimize the PML compiler to generate more efficient Python code",
     "body": "",
-    "status": "todo"
+    "status": "blocked"
   },
   {
     "id": "docs-0003",
     "phase": "docs",
     "title": "Update project documentation with new PML features",
     "body": "",
-    "status": "todo"
+    "status": "blocked"
   },
   {
     "id": "docs-0004",
@@ -53,7 +53,7 @@
     "phase": "runtime",
     "title": "Implement error handling for the runtime environment",
     "body": "",
-    "status": "todo"
+    "status": "doing"
   },
   {
     "id": "spec-0001",
@@ -67,7 +67,7 @@
     "phase": "tests",
     "title": "Write unit tests for the new runtime environment and compiler",
     "body": "",
-    "status": "todo"
+    "status": "blocked"
   },
   {
     "id": "tests-0002",
